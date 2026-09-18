@@ -561,10 +561,11 @@ static void xf16cam_http_page(int fd)
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "<section class='card wide'><h2>Firmware update</h2><p>Choose an OTA image and keep power connected.</p>"
 	                  "<input id=ota type=file accept=.img><button id=otaInstall class=primary type=button onclick=update()>Install update</button> <span id=up aria-live=polite></span></section></div>"
-	                  "<script>let D=document,$=s=>D.querySelector(s),A=s=>D.querySelectorAll(s),vt,vh=0;"
+	                  "<script>let D=document,$=s=>D.querySelector(s),A=s=>D.querySelectorAll(s),vt,vh=0,vLast=0;"
 	                  "function videoStop(h){if(h)vh=1;clearTimeout(vt);let v=$('#video');if(v)v.removeAttribute('src')}"
-	                  "function videoStart(){let v=$('#video');if(!v||vh||D.hidden)return;clearTimeout(vt);v.src='/stream.mjpeg'}"
+	                  "function videoStart(){let v=$('#video');if(!v||vh||D.hidden)return;clearTimeout(vt);vLast=Date.now();v.src='/stream.mjpeg'}"
 	                  "function videoRetry(){clearTimeout(vt);if(!vh&&!D.hidden)vt=setTimeout(videoStart,1500)}"
+	                  "function videoWatch(){let v=$('#video');if(v&&v.getAttribute('src')&&!vh&&!D.hidden&&Date.now()-vLast>8000)videoStart();setTimeout(videoWatch,3000)}"
 	                  "function tab(id){A('.panel').forEach(e=>e.classList.toggle('on',e.id==id));"
 	                  "A('.tabs button').forEach(e=>{let on=e.dataset.tab==id;e.classList.toggle('on',on);e.setAttribute('aria-selected',on)})}"
 	                  "function clearNet(){A('.net').forEach(e=>e.classList.remove('sel'))}"
@@ -585,7 +586,7 @@ static void xf16cam_http_page(int fd)
 	                  "ok=r.ok;s.textContent=ok?t:'Update failed (HTTP '+r.status+')'}catch(e){s.textContent='Connection closed; check for reboot'}finally{b.disabled=false;if(!ok){vh=0;videoStart()}}}"
 	                  "async function meter(){if(!D.hidden&&$('#live').classList.contains('on'))try{"
 	                  "let a=await(await fetch('/api/audio')).json(),m=$('#mic');if(m)m.textContent=a.peak}catch(e){}setTimeout(meter,2000)}"
-	                  "let v=$('#video');if(v){v.onerror=videoRetry;videoStart()}"
+	                  "let v=$('#video');if(v){v.onerror=videoRetry;v.onload=()=>vLast=Date.now();videoStart();videoWatch()}"
 	                  "D.addEventListener('visibilitychange',()=>D.hidden?videoStop():videoStart());"
 	                  "tab('live');meter()</script></main></body></html>");
 }

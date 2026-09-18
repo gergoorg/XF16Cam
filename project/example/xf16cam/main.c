@@ -21,6 +21,7 @@
 #include "net/wlan/wlan_defs.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "sys/sram_heap.h"
 
 #include "xf16cam_config.h"
 #include "xf16cam_audio.h"
@@ -49,7 +50,7 @@
 #define XF16CAM_RTP_SSRC         (0x58463136UL)
 #define XF16CAM_RTP_AUDIO_SSRC   (0x58463137UL)
 #define XF16CAM_RTSP_HANDSHAKE_MS (10000U)
-#define XF16CAM_RTSP_IO_TIMEOUT_MS (2000)
+#define XF16CAM_RTSP_IO_TIMEOUT_MS (5000)
 #define XF16CAM_RTSP_CLIENT_STACK (3 * 1024)
 
 _Static_assert(JPEG_SRAM_SIZE >= JPEG_BUFFER_COUNT *
@@ -91,6 +92,16 @@ static XF16CamMediaClient g_mjpeg_clients[XF16CAM_MAX_PARALLEL_CLIENTS];
 static XF16CamMediaClient g_rtsp_clients[XF16CAM_MAX_PARALLEL_CLIENTS];
 static volatile uint32_t g_mjpeg_active_count;
 static volatile uint32_t g_rtsp_active_count;
+/* A dead client's <img> tag retries every 1.5s (see xf16cam_http.c videoRetry()).
+ * Each attempt spins up a whole new xf16cam-mjpeg thread; deleting a FreeRTOS
+ * task only frees its TCB/stack once the idle task gets to run
+ * prvCheckTasksWaitingTermination(), so a fast enough retry storm (e.g. a
+ * client stuck behind a router that's mid-reboot, failing every send() after
+ * the 2s SO_SNDTIMEO) can create new 3 KiB stacks faster than the idle task
+ * reclaims old ones, starving the single 104 KiB capture arena's malloc().
+ * This floor caps how often a new capture thread can be spun up at all. */
+#define XF16CAM_MJPEG_START_MIN_INTERVAL_MS (750U)
+static uint32_t g_mjpeg_last_start_ms;
 
 __xip_text
 uint32_t xf16cam_media_active_clients(void)
@@ -185,7 +196,8 @@ static int camera_mem_create(CAMERA_JpegCfg *jpeg_cfg, CAMERA_Mgmt *mgmt)
 
 	addr = (uint8_t *)malloc(JPEG_SRAM_SIZE);
 	if (!addr) {
-		printf("malloc fail\n");
+		printf("malloc fail (free heap %lu bytes)\n",
+		       (unsigned long)sram_free_heap_size());
 		return -1;
 	}
 	memset(addr, 0, JPEG_SRAM_SIZE);
@@ -289,9 +301,12 @@ static int xf16cam_camera_acquire(void)
 	    OS_MutexLock(&g_camera_lock, OS_WAIT_FOREVER) != OS_OK)
 		return -1;
 	if (!g_camera_initialized) {
-		if (xf16_board_camera_power_prepare() != 0)
+		if (xf16_board_camera_power_prepare() != 0) {
+			printf("xf16cam camera: power prepare failed\n");
 			goto out;
+		}
 		if (camera_init() != 0) {
+			printf("xf16cam camera: camera_init failed\n");
 			camera_mem_destroy();
 			xf16_board_camera_power_down();
 			goto out;
@@ -428,11 +443,22 @@ static int xf16cam_parse_jpeg(const uint8_t *jpeg, uint32_t len, XF16CamJpeg *ou
 	return out->scan_len ? 0 : -1;
 }
 
+/* Cap each send() well under lwIP's 0xffff single-write chunking threshold
+ * (do_writemore() in api_msg.c): a JPEG frame is ~100 KB, and one send()
+ * call for the whole thing starts a single SO_SNDTIMEO clock that a normal,
+ * merely-slow transfer can outrun mid-flight, not just a dead peer -- which
+ * left the netconn's write state in question when the frame send "timed
+ * out" and the caller moved on to close it. Chunking keeps each send()'s
+ * timeout budget scoped to an amount that should finish quickly even on a
+ * slow link. */
+#define XF16CAM_SEND_CHUNK (4096U)
+
 static int xf16cam_send_all(int fd, const void *data, uint32_t len)
 {
 	const uint8_t *p = data;
 	while (len) {
-		int n = send(fd, p, len, 0);
+		uint32_t chunk = len > XF16CAM_SEND_CHUNK ? XF16CAM_SEND_CHUNK : len;
+		int n = send(fd, p, chunk, 0);
 		if (n <= 0)
 			return -1;
 		p += n;
@@ -540,13 +566,17 @@ static void xf16cam_mjpeg_task(void *arg)
 	int fd = g_mjpeg_clients[slot].fd;
 
 	xf16cam_mjpeg_stream(fd);
-	closesocket(fd);
+	/* closesocket() can wedge forever on a lwIP netconn write/close race (see
+	 * "already writing or closing" in api_msg.c); free everything this slot
+	 * and the shared camera refcount need before risking that, so a stuck
+	 * peer only leaks this one thread instead of a whole client slot. */
 	xf16cam_camera_release();
 	OS_ThreadSetInvalid(&g_mjpeg_clients[slot].thread);
 	__sync_synchronize();
 	g_mjpeg_clients[slot].active = 0;
 	if (g_mjpeg_active_count > 0)
 		__sync_fetch_and_sub(&g_mjpeg_active_count, 1);
+	closesocket(fd);
 	OS_ThreadDelete(NULL);
 }
 
@@ -564,14 +594,28 @@ __xip_text
 int xf16cam_mjpeg_start(int fd)
 {
 	int timeout = XF16CAM_RTSP_IO_TIMEOUT_MS;
+	uint32_t now = OS_TicksToMSecs(OS_GetTicks());
 
-	if (xf16cam_update_active())
+	if (xf16cam_update_active()) {
+		printf("xf16cam WEB: refused, update in progress\n");
 		return -1;
+	}
+	if (g_mjpeg_last_start_ms != 0 &&
+	    now - g_mjpeg_last_start_ms < XF16CAM_MJPEG_START_MIN_INTERVAL_MS) {
+		printf("xf16cam WEB: refused, reconnecting too fast\n");
+		return -1;
+	}
 	int slot = xf16cam_find_mjpeg_slot();
-	if (slot < 0)
+	if (slot < 0) {
+		printf("xf16cam WEB: refused, all %u MJPEG slots busy (camera users=%lu)\n",
+		       XF16CAM_MAX_PARALLEL_CLIENTS, (unsigned long)g_camera_users);
 		return -1;
-	if (xf16cam_camera_acquire() != 0)
+	}
+	if (xf16cam_camera_acquire() != 0) {
+		printf("xf16cam WEB: refused, camera acquire failed (slot=%d)\n", slot);
 		goto fail_slot;
+	}
+	g_mjpeg_last_start_ms = now;
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 	g_mjpeg_clients[slot].fd = fd;
 	__sync_fetch_and_add(&g_mjpeg_active_count, 1);
@@ -1051,12 +1095,13 @@ static void xf16cam_rtsp_client_task(void *arg)
 
 	XF16CAM_XIP_FORMAT(ip, sizeof(ip), "%s", xf16cam_net_ip());
 	xf16cam_stream_client(fd, ip);
-	closesocket(fd);
+	/* see xf16cam_mjpeg_task(): free bookkeeping before the close that can wedge */
 	OS_ThreadSetInvalid(&g_rtsp_clients[slot].thread);
 	__sync_synchronize();
 	g_rtsp_clients[slot].active = 0;
 	if (g_rtsp_active_count > 0)
 		__sync_fetch_and_sub(&g_rtsp_active_count, 1);
+	closesocket(fd);
 	OS_ThreadDelete(NULL);
 }
 

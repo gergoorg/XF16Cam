@@ -244,7 +244,8 @@ static void xf16cam_audio_http_task(void *arg)
 			}
 		}
 	}
-	closesocket(fd);
+	/* see xf16cam_mjpeg_task() in main.c: free bookkeeping before the close
+	 * that can wedge on a lwIP netconn write/close race */
 	xf16cam_audio_release();
 	printf("xf16cam WEB audio client stopped\n");
 	OS_ThreadSetInvalid(&g_audio_http_clients[slot].thread);
@@ -252,6 +253,7 @@ static void xf16cam_audio_http_task(void *arg)
 	g_audio_http_clients[slot].active = 0;
 	if (g_audio_http_clients_active > 0)
 		__sync_fetch_and_sub(&g_audio_http_clients_active, 1);
+	closesocket(fd);
 	OS_ThreadDelete(NULL);
 }
 
