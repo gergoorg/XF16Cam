@@ -442,7 +442,7 @@ void xf16cam_board_init_hardware_watchdog(void)
     WDG_InitParam param;
 
     param.hw.event = WDG_EVT_RESET;
-    param.hw.timeout = WDG_TIMEOUT_5SEC;
+    param.hw.timeout = WDG_TIMEOUT_4SEC;
 	param.hw.resetCycle = WDG_DEFAULT_RESET_CYCLE;
 
     HAL_WDG_Init(&param);
