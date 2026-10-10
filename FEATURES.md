@@ -47,9 +47,9 @@ Variant: *PTZ* = PTZ boards only, *NO_PTZ* = fixed-camera boards only, blank = b
 | Join Wi-Fi network (STA) | OK | OK | `POST /api/wifi` | | Blank password keeps saved credential; reboots |
 | Restore open setup AP | OK | OK | `POST /api/ap` | | Also via serial `wifi ap`; reboots |
 | White/illumination LED state | OK | OK | `GET /api/led` | PTZ | UI shows it as the button label; GET endpoint unused by the page |
-| Toggle white/illumination LED | OK | OK | `POST /api/led` | PTZ | API works on both variants; button renders on PTZ only |
+| Toggle white/illumination LED | OK | OK | `POST /api/led` | PTZ | API works on both variants; button renders on PTZ only; state persists across reboots on PTZ |
 | IR LED state | OK | OK | `GET /api/ir_led` | PTZ | UI shows it as the button label; GET endpoint unused by the page |
-| Toggle IR LED | OK | OK | `POST /api/ir_led` | PTZ | Also switches SP0A39 to night/mono; auto day/night may revert it within 5 s |
+| Toggle IR LED | OK | OK | `POST /api/ir_led` | PTZ | Also switches SP0A39 to night/mono; auto day/night may revert it within 5 s; deliberately not persisted |
 | Automatic day/night switching | - | - | CDS light sensor, ADC5 | PTZ | Every 5 s; avg of 10 samples > 1500 = dark, drives IR LED + sensor night mode |
 | PTZ move / home | OK | OK | `POST /api/ptz` | PTZ | `mode=up\|down\|left\|right\|home`; 501 under NO_PTZ |
 | PTZ idle power-down | - | - | automatic | PTZ | Motors powered down 10 s after the last move |

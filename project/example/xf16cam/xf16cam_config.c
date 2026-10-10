@@ -13,10 +13,22 @@
 #define XF16CAM_CONFIG_SCHEMA         (2U)
 
 /* Schema 2 gives the first byte formerly reserved by schema 1 a defined
- * meaning. Keep the layout unchanged so schema 1 records can be migrated. */
+ * meaning. Keep the layout unchanged so schema 1 records can be migrated.
+ *
+ * led_on is the second such byte and is deliberately NOT a schema 3: the
+ * record keeps its size, so xf16cam_config_storage_valid() still accepts
+ * every deployed record, and each one already carries a zero there, which
+ * reads as "lamp off" -- the behaviour before it had a meaning. Bumping the
+ * schema instead would make older firmware reject the record and reset the
+ * device to AP mode, losing the Wi-Fi credentials. That also makes this the
+ * last field available for free: anything further needs a real schema 3 with
+ * a length change and a migration, or the three padding bytes that sit
+ * between psk and checksum. */
 _Static_assert(sizeof(XF16CamConfig) == 116, "XF16Cam config layout changed");
 _Static_assert(offsetof(XF16CamConfig, resolution) == 10,
 	       "XF16Cam resolution offset changed");
+_Static_assert(offsetof(XF16CamConfig, led_on) == 11,
+	       "XF16Cam LED offset changed");
 _Static_assert(offsetof(XF16CamConfig, ssid) == 12,
 	       "XF16Cam SSID offset changed");
 _Static_assert(offsetof(XF16CamConfig, checksum) == 112,
@@ -111,7 +123,7 @@ int xf16cam_config_init(void)
 		 * resolution selection deterministic and conservative. */
 		config->schema = XF16CAM_CONFIG_SCHEMA;
 		config->resolution = XF16CAM_RESOLUTION_QVGA;
-		config->reserved = 0;
+		config->led_on = 0;
 		config->checksum = xf16cam_config_checksum(config);
 		if (fdcm_write(g_config_store, config, sizeof(*config)) != sizeof(*config)) {
 			printf("xf16cam config: schema 1 migration write failed; using QVGA in RAM\n");
@@ -237,6 +249,34 @@ int xf16cam_config_save_resolution(XF16CamResolution resolution)
 	}
 	config = *xf16cam_config_get();
 	config.resolution = resolution;
+	result = xf16cam_config_write(&config);
+	OS_MutexUnlock(&g_config_lock);
+	return result;
+}
+
+/* Called on every manual lamp toggle, so skip a write when nothing changed:
+ * FDCM appends each record into one of about 34 slots and erases the whole
+ * settings sector when they run out, and that sector also holds the Wi-Fi
+ * credentials. The automatic day/night switching drives the IR LED, not
+ * this lamp, so it never reaches here. */
+int xf16cam_config_save_led(int on)
+{
+	XF16CamConfig config;
+	int result;
+
+	on = on ? 1 : 0;
+	if (!g_config_lock_ready || OS_MutexLock(&g_config_lock, OS_WAIT_FOREVER) != OS_OK)
+		return -1;
+	if (g_update_active) {
+		OS_MutexUnlock(&g_config_lock);
+		return -1;
+	}
+	config = *xf16cam_config_get();
+	if (config.led_on == (uint8_t)on) {
+		OS_MutexUnlock(&g_config_lock);
+		return 0;
+	}
+	config.led_on = (uint8_t)on;
 	result = xf16cam_config_write(&config);
 	OS_MutexUnlock(&g_config_lock);
 	return result;

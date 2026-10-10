@@ -194,7 +194,21 @@ probes the sensor, then **releases** camera power. Resources are demand-driven.
 - **`xf16cam_config.c`** — settings in a dedicated FDCM sector at 1016 KiB, so
   they survive reflashing. Versioned schema with in-place migration. Also owns
   the `xf16cam_update_begin/end` mutual exclusion that serializes reboot-causing
-  operations (OTA, mode change, AP reset).
+  operations (OTA, mode change, AP reset). **`XF16CamConfig` has no spare bytes
+  left**: `led_on` took the last one. Anything further needs a real schema 3,
+  which means a `length` change and therefore a migration, because
+  `xf16cam_config_storage_valid()` rejects any record whose length differs and
+  a rejected record silently resets the device to AP mode.
+- **Saving settings costs flash, so save only on a real change.** FDCM appends
+  each record into one of about 34 slots in the 4 KiB sector and erases the
+  whole sector when they run out — the same sector holding the Wi-Fi
+  credentials. Every save also suspends the scheduler while flash is accessed,
+  a few ms for an append and far longer for an erase. Every save except the
+  LED one happens immediately before a reboot, so the stall was invisible;
+  `xf16cam_config_save_led()` runs while video may be streaming, which is why
+  it returns early when the value is unchanged. **Never persist anything an
+  automatic loop can toggle** — the CDS day/night check drives the IR LED
+  every 5 s and would destroy the sector, which is why it is not saved.
 - **`main.c`** — camera manager (reference-counted PA23 rail shared with the SD
   card), JPEG capture, MJPEG client tasks, and the RTSP/RTP-JPEG server on port
   8554 (RFC 2435, interleaved over RTSP/TCP). One thread per client, up to

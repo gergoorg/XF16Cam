@@ -28,7 +28,7 @@ typedef struct {
 	uint8_t wifi_mode;
 	uint8_t media_mode;
 	uint8_t resolution;
-	uint8_t reserved;
+	uint8_t led_on;
 	char ssid[XF16CAM_SSID_MAX_LEN + 1];
 	char psk[XF16CAM_PSK_MAX_LEN + 1];
 	uint32_t checksum;
@@ -40,6 +40,7 @@ int xf16cam_config_save_sta(const char *ssid, const char *psk);
 int xf16cam_config_save_ap(void);
 int xf16cam_config_save_media(XF16CamMediaMode mode);
 int xf16cam_config_save_resolution(XF16CamResolution resolution);
+int xf16cam_config_save_led(int on);
 int xf16cam_update_begin(void);
 void xf16cam_update_end(void);
 int xf16cam_update_active(void);

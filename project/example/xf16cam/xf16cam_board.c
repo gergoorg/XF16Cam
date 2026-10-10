@@ -146,7 +146,10 @@ static void xf16cam_board_task(void *arg)
 	unsigned int mode_held_ms = 0;
 	unsigned int reset_held_ms = 0;
 	unsigned int blink_ms = 0;
+	#ifndef NO_PTZ
 	unsigned int cds_elapsed_ms = 0;
+	int lamp_restored = 0;
+	#endif
 	int mode_handled = 0;
 	int reset_handled = 0;
 	int led = 0;
@@ -214,10 +217,15 @@ static void xf16cam_board_task(void *arg)
 			continue;
 		}
 		#ifndef NO_PTZ
-		if (led) {
+		if (!lamp_restored) {
+			lamp_restored = 1;
 			led = 0;
-			// PTZ version: LED is luming LED, so turn it off when ready
-			HAL_GPIO_WritePin(XF16CAM_GPIO_PORT, XF16CAM_LED_PIN, GPIO_PIN_LOW);
+			/* The boot blink ends here. On PTZ this LED is the illumination
+			 * lamp rather than a status light, so restore what the user last
+			 * chose instead of forcing it off. Keyed on its own flag, not on
+			 * led: the blink can leave the lamp already dark, and the restore
+			 * still has to run. */
+			xf16cam_board_set_led(xf16cam_config_get()->led_on != 0);
 		}
 		cds_elapsed_ms += XF16CAM_BUTTON_POLL_MS;
 		if (cds_elapsed_ms >= XF16CAM_CDS_CHECK_MS) {
@@ -339,11 +347,14 @@ void xf16cam_board_prepare_sleep(void)
 	#endif
 }
 
+/* Every manual lamp toggle comes through here, so this is where the choice
+ * persists. The boot restore passes the stored value back and writes nothing. */
 __xip_text
 void xf16cam_board_set_led(int on)
 {
 	HAL_GPIO_WritePin(XF16CAM_GPIO_PORT, XF16CAM_LED_PIN,
 	                  on ? GPIO_PIN_HIGH : GPIO_PIN_LOW);
+	xf16cam_config_save_led(on);
 }
 
 int xf16cam_board_get_led_on(void)

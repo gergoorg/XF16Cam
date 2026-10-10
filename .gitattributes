@@ -1,3 +1,11 @@
+# Every text file checks out LF on every platform. The repository stores LF
+# only, the build runs in Linux containers, and GNU patch (patches/*.patch,
+# applied with patch -p1 by the Dockerfile and the workflow) refuses a target
+# whose line endings differ from the patch, which a CRLF checkout under
+# core.autocrlf would hand it. Batch files are the one exception: cmd.exe
+# wants CRLF. Refresh an existing checkout with: git checkout-index -a -f
+* text=auto eol=lf
+
 *.c       text
 *.cpp     text
 *.h       text
@@ -14,3 +22,4 @@
 *.elf     binary
 *.bin     binary
 *.exe     binary
+*.bat     text eol=crlf
