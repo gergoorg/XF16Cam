@@ -24,26 +24,22 @@ static XF16CamPowerInfo g_power;
 
 int xf16cam_power_measure(void)
 {
-	ADC_InitParam param;
 	uint16_t samples[XF16CAM_BATTERY_SAMPLES];
 	uint32_t sample;
 	unsigned int i;
 
-	memset(&param, 0, sizeof(param));
-	param.delay = 10;
-	param.freq = 500000;
-	param.vref_mode = 1; /* 2.5 V reference used by the factory A9 profile. */
-	param.mode = ADC_CONTI_CONV;
-	if (HAL_ADC_Init(&param) != HAL_OK)
+	/* The ADC profile (2.5 V reference, the factory A9 settings) lives in
+	 * xf16cam_board.c, which shares the converter with the CDS check. */
+	if (xf16cam_board_adc_acquire() != 0)
 		goto fail;
 	for (i = 0; i < XF16CAM_BATTERY_SAMPLES; ++i) {
 		if (HAL_ADC_Conv_Polling(XF16CAM_BATTERY_CHANNEL, &sample, 100) != HAL_OK) {
-			HAL_ADC_DeInit();
+			xf16cam_board_adc_release();
 			goto fail;
 		}
 		samples[i] = (uint16_t)(sample & 0xfff);
 	}
-	HAL_ADC_DeInit();
+	xf16cam_board_adc_release();
 	/* Wi-Fi and the analogue microphone can occasionally disturb one ADC
 	 * conversion. An in-place insertion sort gives a robust median without
 	 * adding heap use or a generic sorting-library dependency. */

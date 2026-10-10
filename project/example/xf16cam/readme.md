@@ -14,6 +14,10 @@ single-client RTSP stream without PSRAM or an SD card.
 - Saved settings use a dedicated FDCM sector and survive firmware reflashing.
 - Schema-1 settings migrate in place with network and media choices preserved;
   resolution starts conservatively at QVGA because its old reserved byte was undefined.
+- The settings record ends in an integration block owned by the build variant
+  that wrote it (`_mqtt`, `_esphome` or none). An OTA between variants keeps
+  Wi-Fi, media mode and resolution and clears only that block, so the
+  integration is set up again on its own page after the switch.
 - Leaving the password blank for the currently saved secured SSID preserves
   that credential; a blank password for a different SSID selects an open network.
 - A failed STA connection falls back to the open setup AP.
@@ -115,8 +119,9 @@ buffer immutable while a frame is transmitted, so the larger per-frame ceiling
 costs slightly less SRAM than the former pair of 50 KiB buffers.
 Frames are acquired one at a time so a slow network client cannot race the
 hardware encoder and observe a buffer while it is being overwritten.
-The shared PA23 camera/SD rail, capture arena, and AMIC are demand-driven: boot
-probes the sensor, then releases resources. Camera and mounted storage hold
+The shared PA23 camera/SD rail and AMIC are demand-driven: boot probes the
+sensor, then releases them. The capture arena is a static array that lives for
+the whole uptime; a heap allocation that size did not survive fragmentation. Camera and mounted storage hold
 separate rail references; ejecting the card permits power-down when media is idle.
 XF16Cam owns camera power, CSI/JPEG, and its media listeners; the SDK platform
 starts the underlying Wi-Fi/lwIP services. `PRJCONF_CONSOLE_EN` remains enabled
@@ -167,6 +172,69 @@ The flashable result is
 `project/example/xf16cam/image/xr872/xr_system.img`; its web-update partner is
 `xr_system_img_xz.img` in the same directory.
 
+## Home Assistant via MQTT (`_mqtt` builds)
+
+Images built with the `_mqtt` suffix (`buildXF16Cam.bat ptz_mqtt`) carry an
+MQTT client aimed at Home Assistant's core MQTT integration, so the camera
+appears as one device with no custom component installed:
+
+- Network tab, MQTT card: broker IP (an IP literal; DNS is not compiled in),
+  port, optional username and password, and the image interval. Saving
+  reboots; a blank broker turns MQTT off. The client runs only in station
+  mode.
+- Topics under `xf16cam/<XF16CAM-XXXXXX>/`: `status` (`online`/`offline`,
+  retained, `offline` is the last will), `state` (retained JSON, on change
+  and every 60 s), `image` (a retained JPEG per interval, browser-video mode
+  only), and `cmd/led`, `cmd/ir` (`ON`/`OFF`), `cmd/ptz`
+  (`up|down|left|right|home`), `cmd/reboot` (`PRESS`).
+- Discovery on `homeassistant/device/<XF16CAM-XXXXXX>/config` creates one
+  device (MAC as its connection, model `XR872 PTZ` or `XR872 A9`, the image
+  sensor as hardware) with the camera (browser-video mode), the flash and IR
+  lights, PTZ buttons, a reboot button under Configuration and
+  diagnostic sensors (IP, uptime, chip temperature, free heap, media mode,
+  resolution, stream URL, battery, boot reason, SD card, sensor). Only the
+  camera, Flash Light, PTZ, reboot, IP, resolution and stream URL entities
+  start enabled; the IR light (the CDS check overrides it within 5 s) and
+  the other diagnostics are created disabled and can be enabled in Home
+  Assistant per entity. PTZ is
+  buttons because MQTT discovery has no PTZ service; that arrives with the
+  custom integration. Deleting the device in Home Assistant is undone at the
+  camera's next connect, which re-publishes discovery by design. In
+  RTSP mode the camera entity is withdrawn and the `state` document carries
+  `rtsp://<ip>:8554/stream` for a future custom integration.
+- While an image is being sent the capture lock is held, so browser MJPEG
+  viewers pause for that moment. Publishing an image every 10 s keeps the
+  sensor powered; intervals above 20 s power it per shot.
+
+## Home Assistant via the ESPHome API (`_esphome` builds)
+
+Images built with the `_esphome` suffix (`buildXF16Cam.bat ptz_esphome`)
+carry an ESPHome native API server instead of the MQTT client (one image
+never has both), so Home Assistant's core ESPHome integration talks to the
+camera directly, with no broker:
+
+- Add the device in Home Assistant with **Add integration > ESPHome** and
+  the camera's IP address and port 6053. There is no mDNS (IGMP is linked
+  out), so give the camera a DHCP reservation. Home Assistant generates and
+  provisions the encryption key itself on the first connection; the Network
+  tab card can also generate a key (shown once, to paste into Home
+  Assistant) or clear it. A keyed camera refuses plaintext.
+- Entities match the MQTT discovery set: the camera (browser-video mode),
+  the flash and IR lights, PTZ buttons, a reboot button under Configuration
+  and the diagnostic sensors (IP, uptime, chip temperature, free heap, media
+  mode, resolution, stream URL, battery, boot reason, SD card, sensor), with
+  the same ones created disabled. States are pushed on change and every
+  60 s.
+- The camera entity is Home Assistant's own frame-by-frame view: each
+  request yields one JPEG, so the live view runs at whatever rate the
+  request round trip allows, and snapshots work without a stream. The RTSP
+  stream is still the way to get real video (generic camera or go2rtc), as
+  with the MQTT build.
+- Up to two clients. Runs in station mode only; the task retires in AP mode.
+- `tools/xf16cam/esphome_check.py` (needs `pip install aioesphomeapi`)
+  lists entities, follows states, saves an image, measures stream frame
+  rate, toggles lights, presses buttons and provisions or clears the key.
+
 ## 1 MiB flash layout
 
 - `0-32 KiB`: bootloader and reserved space
@@ -186,7 +254,9 @@ verification, so a failed or interrupted upload leaves the current firmware
 bootable. Do not upload the full serial image through the web page.
 
 CI additionally requires at least 8 KiB free in the SRAM-loaded app slot and
-64 KiB free in both the XIP and compressed-OTA areas. This prevents ordinary
+64 KiB free in both the XIP and compressed-OTA areas (56 KiB of XIP on
+`_mqtt` builds, which carry the Paho client, 48 KiB on `_esphome` builds,
+which carry the API server and ChaCha20-Poly1305). This prevents ordinary
 feature growth from silently consuming the final usable bytes. A symbol-placement
 check also requires the flash identity query to remain in SRAM and uninlined,
 preventing code from disabling XIP while it is executing from flash.

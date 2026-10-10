@@ -31,7 +31,9 @@ means it is currently on). Those two endpoints exist only for external clients.
 
 Legend: OK = supported, "-" = not exposed there.
 UI = visible or actionable in the web console. API = has a dedicated endpoint.
-Variant: *PTZ* = PTZ boards only, *NO_PTZ* = fixed-camera boards only, blank = both.
+Variant: *PTZ* = PTZ boards only, *NO_PTZ* = fixed-camera boards only,
+*MQTT* = `_mqtt` builds only (`XF16CAM_MQTT`), *ESPHome* = `_esphome` builds
+only (`XF16CAM_ESPHOME`), blank = both boards.
 
 | Feature | UI | API | Endpoint / control | Variant | Notes |
 | --- | :--: | :--: | --- | :--: | --- |
@@ -46,6 +48,17 @@ Variant: *PTZ* = PTZ boards only, *NO_PTZ* = fixed-camera boards only, blank = b
 | Wi-Fi scan | OK | OK | `GET /api/scan` | | Sorted by RSSI, click a result to fill the SSID field |
 | Join Wi-Fi network (STA) | OK | OK | `POST /api/wifi` | | Blank password keeps saved credential; reboots |
 | Restore open setup AP | OK | OK | `POST /api/ap` | | Also via serial `wifi ap`; reboots |
+| MQTT broker settings | OK | OK | `POST /api/mqtt` | MQTT | Network tab card: broker IP, port, user, password, image interval; blank password keeps the saved one; reboots |
+| MQTT availability + state | - | - | `xf16cam/<host>/status`, `/state` | MQTT | `online`/`offline` (LWT) and a retained JSON state document on change and every 60 s; same keys in both media modes |
+| MQTT JPEG snapshots | - | - | `xf16cam/<host>/image` | MQTT | Web media mode only; one retained frame per interval (default 10 s); RTSP mode publishes the stream URL in `state` instead |
+| MQTT commands | - | - | `xf16cam/<host>/cmd/led`, `/ir`, `/ptz`, `/reboot` | MQTT | `ON`/`OFF`, `up\|down\|left\|right\|home`, `PRESS` |
+| Home Assistant discovery | - | - | `homeassistant/device/<host>/config` | MQTT | One device (MAC connection, model `XR872 PTZ`/`XR872 A9`, sensor as hardware): camera (web mode), Flash/IR lights, PTZ buttons, reboot (config), diagnostic sensors incl. boot reason; the IR light and every diagnostic except IP, resolution and stream URL are created disabled; re-sent on HA's birth message |
+| MQTT diagnostics | OK | OK | Network tab, System tab, `/api/system` (`mqtt`) | MQTT | Connection state, connect/image/state/command counters, dropped packets, task stack spare |
+| ESPHome native API | - | OK | TCP 6053 | ESPHome | Home Assistant's ESPHome integration connects directly (add by IP; no mDNS); plaintext or Noise encryption; API version 1.10; up to 2 clients; station mode only |
+| ESPHome entities | - | - | ESPHome API | ESPHome | Same set as MQTT discovery: camera (web mode), Flash/IR lights, PTZ buttons, reboot (config), diagnostic binary/text/numeric sensors; states pushed on change and every 60 s |
+| ESPHome camera frames | - | - | ESPHome API `CameraImageRequest` | ESPHome | One JPEG per request in 1390-byte chunks; the camera stays held while a stream request is under 5 s old; web media mode only |
+| ESPHome encryption key | OK | OK | `POST /api/esphome` (`action=generate\|clear`) | ESPHome | Home Assistant provisions a key itself on first connect; the Network tab card can generate one (shown once) or clear it; no reboot |
+| ESPHome diagnostics | OK | OK | Network tab, System tab, `/api/system` (`esphome`) | ESPHome | Task state, client count, encryption and key state, connect/frame/state/command counters, dropped messages, rejected handshakes, task stack spare |
 | White/illumination LED state | OK | OK | `GET /api/led` | PTZ | UI shows it as the button label; GET endpoint unused by the page |
 | Toggle white/illumination LED | OK | OK | `POST /api/led` | PTZ | API works on both variants; button renders on PTZ only |
 | IR LED state | OK | OK | `GET /api/ir_led` | PTZ | UI shows it as the button label; GET endpoint unused by the page |
@@ -53,7 +66,7 @@ Variant: *PTZ* = PTZ boards only, *NO_PTZ* = fixed-camera boards only, blank = b
 | Automatic day/night switching | - | - | CDS light sensor, ADC5 | PTZ | Every 5 s; avg of 10 samples > 1500 = dark, drives IR LED + sensor night mode |
 | PTZ move / home | OK | OK | `POST /api/ptz` | PTZ | `mode=up\|down\|left\|right\|home`; 501 under NO_PTZ |
 | PTZ idle power-down | - | - | automatic | PTZ | Motors powered down 10 s after the last move |
-| Measure battery voltage | OK | OK | `POST /api/power` | | PA16/ADC6, median of 11; uncalibrated, charging always "Unknown" |
+| Measure battery voltage | OK | OK | `POST /api/power` | | PA16/ADC6, median of 11; shares the ADC with the CDS check under a lock; uncalibrated, charging always "Unknown" |
 | Hibernate | OK | OK | `POST /api/hibernate` | NO_PTZ | Wakes on PA20; quiesces media first; PTZ builds have no route or button (404) |
 | Mount / check SD card | OK | OK | `POST /api/sd/refresh` | | 503 when no readable FAT card |
 | Safely eject SD card | OK | OK | `POST /api/sd/eject` | | Releases the shared PA23 rail |

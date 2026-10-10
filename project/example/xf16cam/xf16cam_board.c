@@ -58,6 +58,52 @@ static char g_crash_task_name[32];
 
 #define CRASH_MAGIC_NUMBER  (0xAA)
 
+/* One ADC, two users: the CDS light check (PTZ, every 5 s) and the battery
+ * divider (Measure button). The HAL refuses a second HAL_ADC_Init while the
+ * first is live ("ADC state: 3"), which is how the battery measurement
+ * broke once the CDS check stopped re-initialising per cycle, and its
+ * HAL_ADC_DeInit would have pulled the ADC from under the CDS check. Both
+ * go through the lock below instead. */
+static OS_Mutex_t g_adc_lock;
+static int g_adc_lock_ready;
+static int g_adc_ready;
+
+__xip_text
+int xf16cam_board_adc_acquire(void)
+{
+	ADC_InitParam param;
+
+	if (!g_adc_lock_ready || OS_MutexLock(&g_adc_lock, OS_WAIT_FOREVER) != OS_OK)
+		return -1;
+	if (g_adc_ready)
+		return 0;
+	memset(&param, 0, sizeof(param));
+	param.delay = 10;
+	param.freq = 500000;
+	param.vref_mode = 1;	/* 2.5 V reference, the factory A9 profile */
+	param.mode = ADC_CONTI_CONV;
+	if (HAL_ADC_Init(&param) != HAL_OK) {
+		OS_MutexUnlock(&g_adc_lock);
+		return -1;
+	}
+	g_adc_ready = 1;
+	return 0;
+}
+
+__xip_text
+void xf16cam_board_adc_release(void)
+{
+#ifdef NO_PTZ
+	/* No permanent user on a fixed camera: give the ADC back so the
+	 * board behaves as it did before the battery button shared it. */
+	if (g_adc_ready) {
+		HAL_ADC_DeInit();
+		g_adc_ready = 0;
+	}
+#endif
+	OS_MutexUnlock(&g_adc_lock);
+}
+
 static int xf16cam_button_pressed(GPIO_Pin pin)
 {
 	return HAL_GPIO_ReadPin(XF16CAM_GPIO_PORT, pin) == GPIO_PIN_LOW;
@@ -76,24 +122,6 @@ int xf16cam_board_reset_button_pressed(void)
 }
 
 #ifndef NO_PTZ
-static int g_cds_adc_ready;
-
-__xip_text
-static int xf16cam_board_cds_adc_init(void)
-{
-	ADC_InitParam param;
-
-	memset(&param, 0, sizeof(param));
-	param.delay = 10;
-	param.freq = 500000;
-	param.vref_mode = 1;
-	param.mode = ADC_CONTI_CONV;
-	if (HAL_ADC_Init(&param) != HAL_OK)
-		return -1;
-	g_cds_adc_ready = 1;
-	return 0;
-}
-
 __xip_text
 static int xf16cam_board_cds_is_dark(void)
 {
@@ -102,15 +130,18 @@ static int xf16cam_board_cds_is_dark(void)
 	uint32_t total = 0;
 	unsigned int index;
 
-	// The ADC is initialized once at startup; re-initializing it on every check
-	// leaked heap on every cycle and drained it after a couple of hours.
-	if (!g_cds_adc_ready && xf16cam_board_cds_adc_init() != 0)
+	/* The ADC stays initialised between checks: re-initialising it on
+	 * every cycle leaked heap and drained it after a couple of hours. */
+	if (xf16cam_board_adc_acquire() != 0)
 		return -1;
 	for (index = 0; index < XF16CAM_CDS_SAMPLES; ++index) {
-		if (HAL_ADC_Conv_Polling(XF16CAM_CDS_CHANNEL, &sample, 100) != HAL_OK)
+		if (HAL_ADC_Conv_Polling(XF16CAM_CDS_CHANNEL, &sample, 100) != HAL_OK) {
+			xf16cam_board_adc_release();
 			return -1;
+		}
 		samples[index] = (uint16_t)(sample & 0xfff);
 	}
+	xf16cam_board_adc_release();
 	for (index = 1; index < XF16CAM_CDS_SAMPLES; ++index) {
 		uint16_t value = samples[index];
 		unsigned int sorted = index;
@@ -127,7 +158,7 @@ static int xf16cam_board_cds_is_dark(void)
 }
 #endif
 
-static void xf16cam_board_reboot(void)
+void xf16cam_board_reboot(void)
 {
 	if (xf16cam_update_begin() != 0) {
 		printf("xf16cam reboot deferred: firmware update is active\n");
@@ -275,6 +306,8 @@ static void xf16cam_board_task(void *arg)
 
 int xf16cam_board_init(void)
 {
+	if (!g_adc_lock_ready && OS_MutexCreate(&g_adc_lock) == OS_OK)
+		g_adc_lock_ready = 1;
 	GPIO_InitParam input = {
 		.mode = GPIOx_Pn_F0_INPUT,
 		.driving = GPIO_DRIVING_LEVEL_1,

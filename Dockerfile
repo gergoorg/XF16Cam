@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     xz-utils \
+    libmbedtls-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the Arm GNU Toolchain (matches carlosperate/arm-none-eabi-gcc-action@v1, release 8-2019-q3)
@@ -27,13 +28,31 @@ ENV PATH="/opt/arm-gnu-toolchain/bin:${PATH}"
 WORKDIR /workspace
 COPY --exclude=./dist --exclude=./.git . .
 
-# Test RTSP request parser
+# Test RTSP request parser and MQTT payload generators
 RUN cc -std=c11 -Wall -Wextra -Werror \
     -Iinclude -Iproject/example/xf16cam \
     tests/xf16cam/test_rtsp_parser.c \
     project/example/xf16cam/xf16cam_rtsp_parser.c \
     -o /tmp/xf16cam-rtsp-parser-test \
-    && /tmp/xf16cam-rtsp-parser-test
+    && /tmp/xf16cam-rtsp-parser-test \
+    && cc -std=c11 -Wall -Wextra -Werror -DXF16CAM_MQTT \
+    -Iinclude -Iproject/example/xf16cam \
+    tests/xf16cam/test_mqtt_payload.c \
+    project/example/xf16cam/xf16cam_mqtt_payload.c \
+    -o /tmp/xf16cam-mqtt-payload-test \
+    && /tmp/xf16cam-mqtt-payload-test \
+    && cc -std=c11 -Wall -Wextra -Werror \
+    -Iinclude -Iproject/example/xf16cam \
+    tests/xf16cam/test_esphome_proto.c \
+    project/example/xf16cam/xf16cam_esphome_proto.c \
+    -o /tmp/xf16cam-esphome-proto-test \
+    && /tmp/xf16cam-esphome-proto-test \
+    && cc -std=c11 -Wall -Wextra -Werror -DXF16CAM_NOISE_INITIATOR \
+    -Iinclude -Iproject/example/xf16cam \
+    tests/xf16cam/test_esphome_noise.c \
+    project/example/xf16cam/xf16cam_esphome_noise.c \
+    -lmbedcrypto -o /tmp/xf16cam-esphome-noise-test \
+    && /tmp/xf16cam-esphome-noise-test
 
 # Configure XR872 build
 RUN printf '%s\n' \
@@ -44,17 +63,33 @@ RUN printf '%s\n' \
 # Apply os_thread.c.patch
 RUN patch -p1 < patches/os_thread.c.patch
 
+# _esphome builds need a third lwIP listen PCB (HTTP and RTSP hold the two
+# the SDK allows): patches/lwipopts.h.patch, applied the same way, on this
+# copy of the tree only.
+RUN case "$BUILD_VARIANT" in \
+    *_esphome) patch -p1 < patches/lwipopts.h.patch ;; \
+    esac
+
 # Build flash and OTA images. Pass BUILD_VARIANT=no_ptz for the fixed-camera
-# board; the default PTZ build leaves NO_PTZ undefined. A _netlog suffix adds
-# XF16CAM_NETLOG, the UDP console mirror (see xf16cam_log.c).
+# board; the default PTZ build leaves NO_PTZ undefined. Optional suffixes, in
+# this order: _netlog adds XF16CAM_NETLOG, the UDP console mirror (see
+# xf16cam_log.c); then one integration: _mqtt adds XF16CAM_MQTT, the Home
+# Assistant MQTT client (xf16cam_mqtt.c), or _esphome adds XF16CAM_ESPHOME,
+# the ESPHome native API server (xf16cam_esphome.c). So ptz, no_ptz,
+# ptz_netlog, ptz_mqtt, ptz_netlog_mqtt, ptz_esphome, ptz_netlog_esphome and
+# the no_ptz equivalents.
 RUN variant="$BUILD_VARIANT"; symbols=""; \
     case "$variant" in \
-    *_netlog) symbols="-DXF16CAM_NETLOG"; variant="${variant%_netlog}" ;; \
+    *_mqtt) symbols="-DXF16CAM_MQTT"; variant="${variant%_mqtt}" ;; \
+    *_esphome) symbols="-DXF16CAM_ESPHOME"; variant="${variant%_esphome}" ;; \
+    esac; \
+    case "$variant" in \
+    *_netlog) symbols="-DXF16CAM_NETLOG $symbols"; variant="${variant%_netlog}" ;; \
     esac; \
     case "$variant" in \
     ptz) ;; \
-    no_ptz) symbols="$symbols -DNO_PTZ" ;; \
-    *) echo "Invalid BUILD_VARIANT: $BUILD_VARIANT (use ptz or no_ptz, optionally with _netlog)" >&2; exit 1 ;; \
+    no_ptz) symbols="-DNO_PTZ $symbols" ;; \
+    *) echo "Invalid BUILD_VARIANT: $BUILD_VARIANT (use ptz or no_ptz, optionally with _netlog and one of _mqtt or _esphome)" >&2; exit 1 ;; \
     esac \
     && make -C project/example/xf16cam/gcc \
     CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")" \
@@ -68,21 +103,43 @@ RUN variant="$BUILD_VARIANT"; symbols=""; \
 # stay compiled in on both variants: hal_flashctrl.c keys its SBUS re-init
 # workaround (FLASHC_TEMP_FIXED) to CONFIG_PM, and without it the first flash
 # write -- an OTA piece or a settings save -- hangs the device.
-RUN python3 tools/xf16cam/check_symbol_placement.py \
+# The integration sentinels prove each client is present only on its own
+# builds and, when present, executes from XIP.
+RUN case "$BUILD_VARIANT" in \
+    *_mqtt) integration_check="--require-xip xf16cam_mqtt_task --require-absent xf16cam_esphome_task" ;; \
+    *_esphome) integration_check="--require-xip xf16cam_esphome_task --require-xip mbedtls_chachapoly_encrypt_and_tag --require-absent xf16cam_mqtt_task" ;; \
+    *) integration_check="--require-absent xf16cam_mqtt_task --require-absent xf16cam_esphome_task" ;; \
+    esac \
+    && python3 tools/xf16cam/check_symbol_placement.py \
     --elf project/example/xf16cam/gcc/xf16cam.axf \
     --require-sram xf16cam_http_flash_info \
     --require-sram xf16cam_http_ota \
     --require-sram flashc_suspend \
     --require-xip xf16cam_http_start \
     --require-absent dns_table \
-    --require-absent igmp_group_list
+    --require-absent igmp_group_list \
+    $integration_check
 
-# Check 1 MiB flash budget
-RUN mkdir -p dist \
+# Check 1 MiB flash budget. The Paho client and the discovery document cost
+# about 12 KB of XIP, more than the headroom above the 64 KiB floor, so
+# _mqtt builds keep a 56 KiB XIP reserve instead; the ESPHome server costs
+# about the same plus ChaCha20-Poly1305 and gets 48 KiB. Since upstream's
+# stack protector and crash detection (about 4 KB of XIP and 3.4 KB of the
+# compressed OTA image on every variant) the ESPHome image also sits a little
+# under the 64 KiB OTA floor, so it is checked with a 60 KiB OTA reserve.
+RUN ota_reserve=64K; case "$BUILD_VARIANT" in \
+    *_mqtt) xip_reserve=56K ;; \
+    *_esphome) xip_reserve=48K; ota_reserve=60K ;; \
+    *) xip_reserve=64K ;; \
+    esac \
+    && mkdir -p dist \
     && python3 tools/xf16cam/check_image_budget.py \
     --config project/example/xf16cam/image/xr872/image_auto_cal.cfg \
     --image-dir project/example/xf16cam/image/xr872 \
-    | tee dist/image-budget.txt
+    --xip-reserve "$xip_reserve" --ota-reserve "$ota_reserve" \
+    > dist/image-budget.txt; rc=$?; cat dist/image-budget.txt; test "$rc" -eq 0
+# (no pipefail in /bin/sh: a tee pipe would hide a failed check behind tee's
+# status, which let an over-budget image through once)
 
 # Package flash image
 RUN version="$(sed -n 's/^#define XF16CAM_VERSION "\([^"]*\)"/\1/p' \

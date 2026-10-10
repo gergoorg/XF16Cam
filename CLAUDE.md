@@ -33,7 +33,8 @@ lint step and no test runner beyond one host-compiled unit test.
 Windows (Docker, produces `dist/`):
 
 ```bat
-buildXF16Cam.bat ptz      REM or: no_ptz, ptz_netlog, no_ptz_netlog
+buildXF16Cam.bat ptz      REM or: no_ptz, ptz_netlog, no_ptz_netlog, ptz_mqtt, no_ptz_mqtt,
+                          REM ptz_esphome, no_ptz_esphome, ptz_netlog_esphome
 ```
 
 Linux/CI-equivalent, with `arm-none-eabi-gcc` on `PATH`:
@@ -43,7 +44,9 @@ printf '%s\n' '__CONFIG_CHIP_TYPE ?= xr872' '__CONFIG_HOSC_TYPE ?= 40' > .config
 chmod +x tools/mkimage
 make -C project/example/xf16cam/gcc \
   CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")" \
-  PRJ_EXTRA_SYMBOLS="" image      # add -DNO_PTZ for the fixed-camera board
+  PRJ_EXTRA_SYMBOLS="" image      # add -DNO_PTZ for the fixed-camera board,
+                                  # -DXF16CAM_MQTT for the Home Assistant MQTT client
+                                  # or -DXF16CAM_ESPHOME for the ESPHome native API
 make -C project/example/xf16cam/gcc \
   CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")" \
   PRJ_EXTRA_SYMBOLS="" image_xz
@@ -81,20 +84,47 @@ tree can be updated without losing anything:
   when that code is compiled, in SRAM on both variants so this is not repeated. The hibernate route, button and function are still
   `#ifdef NO_PTZ`; that part costs nothing and is purely about not exposing a
   control the board cannot honour.
+- The one SDK value the camera cannot live with, lwIP's listen PCB pool of
+  2, is rewritten at build time by `patches/lwipopts.h.patch` on `_esphome`
+  builds only, applied with `patch -p1` next to upstream's
+  `patches/os_thread.c.patch` (see the ESPHome paragraph below); the header
+  in git stays the vendor's. `.gitattributes` checks every text file out LF
+  (`* text=auto eol=lf`, batch files excepted): GNU patch rejects a CRLF
+  target, which a Windows checkout under autocrlf would otherwise hand the
+  Docker build. Refresh an older checkout with
+  `git ls-files -z | xargs -0 rm -f && git checkout -- .`.
 
 ### Test
 
-One host test, run before the firmware build in both CI and the Dockerfile:
+Four host tests, run before the firmware build in both CI and the Dockerfile:
 
 ```sh
 cc -std=c11 -Wall -Wextra -Werror -Iinclude -Iproject/example/xf16cam \
   tests/xf16cam/test_rtsp_parser.c project/example/xf16cam/xf16cam_rtsp_parser.c \
   -o /tmp/xf16cam-rtsp-parser-test && /tmp/xf16cam-rtsp-parser-test
+cc -std=c11 -Wall -Wextra -Werror -DXF16CAM_MQTT -Iinclude -Iproject/example/xf16cam \
+  tests/xf16cam/test_mqtt_payload.c project/example/xf16cam/xf16cam_mqtt_payload.c \
+  -o /tmp/xf16cam-mqtt-payload-test && /tmp/xf16cam-mqtt-payload-test
+cc -std=c11 -Wall -Wextra -Werror -Iinclude -Iproject/example/xf16cam \
+  tests/xf16cam/test_esphome_proto.c project/example/xf16cam/xf16cam_esphome_proto.c \
+  -o /tmp/xf16cam-esphome-proto-test && /tmp/xf16cam-esphome-proto-test
+cc -std=c11 -Wall -Wextra -Werror -DXF16CAM_NOISE_INITIATOR -Iinclude -Iproject/example/xf16cam \
+  tests/xf16cam/test_esphome_noise.c project/example/xf16cam/xf16cam_esphome_noise.c \
+  -lmbedcrypto -o /tmp/xf16cam-esphome-noise-test && /tmp/xf16cam-esphome-noise-test
 ```
 
 The RTSP request parser is deliberately factored out of `main.c` into
-`xf16cam_rtsp_parser.c` so it can be compiled and tested on the host. Keep new
-pure-logic code testable the same way.
+`xf16cam_rtsp_parser.c` so it can be compiled and tested on the host, the
+MQTT state/discovery generators and PUBLISH header encoder live in
+`xf16cam_mqtt_payload.c` for the same reason, and the ESPHome protobuf
+helpers (`xf16cam_esphome_proto.c`) and Noise handshake
+(`xf16cam_esphome_noise.c`, crypto through a vtable, desktop mbedtls on the
+host: `libmbedtls-dev`) likewise. Keep new pure-logic code testable the same
+way. There is no C compiler on the Windows host; run the tests in a container.
+The main tree is a Docker shared path (`docker run --rm -v D:/...:/w -w /w
+xf16cam-build sh -c '...'`, with `MSYS_NO_PATHCONV=1` from Git Bash); a
+worktree is not, so stage the files and `docker cp` them into a created
+container instead.
 
 ### Gates CI enforces (run these locally before claiming a change fits)
 
@@ -118,20 +148,110 @@ The absent sentinels prove the lwIP link-out still takes effect after an SDK
 update. `flashc_suspend`, the flash controller's PM hook, must be in SRAM on
 both variants: power management cannot be compiled out (see Build).
 
-CI builds `ptz`, `no_ptz` and `ptz_netlog`; a change must compile under all
-of them. `-DXF16CAM_NETLOG` (the `_netlog` suffix) compiles in the console
-mirror: `xf16cam_log.c` installs its own libc stdout writer, so every
-`printf` in the system still reaches the UART and is also kept in a 2 KiB
-RAM ring that the board task broadcasts over UDP port 5514 and `GET /api/log`
-returns as text. It exists because the board has no serial connection
-without disassembly; `tools/xf16cam/udplog.py` is the PC side. The writer
-itself must stay in SRAM (no `__xip_text`), since printf runs while flash is
-disabled during OTA and settings writes. Nothing survives a reset, so every
-deliberate reboot calls `xf16cam_log_flush()` first and the reason it printed
-leaves the board; a hard fault does not reboot at all (the ROM handler halts,
-and the hardware watchdog is not enabled), so a silent hang with no boot
-marker is a crash. Measured cost on `ptz`: 120 bytes of app slot, 376 bytes
-of XIP, plus the 2 KiB ring in `.bss`.
+The variant name is `ptz` or `no_ptz` plus optional suffixes, in this order:
+`_netlog`, then at most one integration suffix, `_mqtt` or `_esphome`. CI
+builds `ptz`, `no_ptz`, `ptz_netlog`, `ptz_mqtt`, `no_ptz_mqtt`,
+`ptz_esphome` and `no_ptz_esphome`; a change must compile under all of them.
+The Dockerfile and the workflow each map the suffixes to `-DXF16CAM_NETLOG`,
+`-DXF16CAM_MQTT` or `-DXF16CAM_ESPHOME` on their own; keep the two in step.
+The two integrations are mutually exclusive (`xf16cam_config.h` has the
+`#error`): they expose the same device, only the protocol differs, and one
+image never carries both. Both CI sentinels (`xf16cam_mqtt_task`,
+`xf16cam_esphome_task`) are checked on every variant: in XIP on its own
+builds, absent elsewhere.
+
+`XF16CAM_NETLOG` (the `_netlog` suffix) compiles in the console mirror:
+`xf16cam_log.c` installs its own libc stdout writer, so every `printf` in the
+system still reaches the UART and is also kept in a 2 KiB RAM ring that the
+board task broadcasts over UDP port 5514 and `GET /api/log` returns as text.
+It exists because the board has no serial connection without disassembly;
+`tools/xf16cam/udplog.py` is the PC side. The writer itself must stay in SRAM
+(no `__xip_text`), since printf runs while flash is disabled during OTA and
+settings writes. Nothing survives a reset, so every deliberate reboot calls
+`xf16cam_log_flush()` first and the reason it printed leaves the board; a
+hard fault does not reboot at all (the ROM handler halts, and the hardware
+watchdog is not enabled), so a silent hang with no boot marker is a crash.
+Measured cost on `ptz`: 120 bytes of app slot, 376 bytes of XIP, plus the
+2 KiB ring in `.bss`.
+
+`XF16CAM_MQTT` (the `_mqtt` suffix) compiles in `xf16cam_mqtt.c`, an MQTT
+client for Home Assistant: retained device discovery on
+`homeassistant/device/<host>/config`, a state document on
+`xf16cam/<host>/state`, a JPEG per interval on `xf16cam/<host>/image` in
+browser media mode, `online`/`offline` on `xf16cam/<host>/status` (the LWT),
+and commands on `xf16cam/<host>/cmd/{led,ir,ptz,reboot}`; the state JSON has
+the same keys in both media modes, carrying the RTSP URL when there is no
+image. It is opt-in because the vendored Paho client (`src/net/mqtt`, always
+on the link line, placed in XIP by `appos.ld`, garbage-collected until
+referenced) plus the discovery text costs 13.5 KB of XIP and 672 bytes of app
+slot (`ptz_mqtt` 0.17.16: 19,720 / 62,600 / 69,332 free against 20,408 /
+77,092 / 77,604 for plain `ptz`), more than the headroom above the 64 KiB
+floor, so `_mqtt` builds are checked with `--xip-reserve 56K`. The client uses the library only for CONNECT, SUBSCRIBE,
+PING and DISCONNECT: `MQTTPublish` needs the whole packet in its buffer, so
+every publish here streams its payload behind a header from
+`xf16cam_mqtt_publish_header()`, and `MQTTYield` overflows the read buffer on
+an oversize inbound packet (its assert only prints), so `xf16cam_mqtt_poll()`
+reads the fixed header itself and drains what does not fit. Do not call
+`MQTTYield` or `MQTTPublish` on that client. The publisher holds the camera
+between shots for intervals up to 20 s (a cold acquire re-inits the sensor);
+longer intervals acquire per shot because a held camera counts for the board
+task's 30 s stall watchdog. It releases the camera whenever an update holds
+the lock. The broker must be an IP literal: lwIP DNS stays linked out, and
+`xf16cam_lwip_stubs.c` resolves literals through `getaddrinfo`. The task is
+created in `main()` before the network exists; it sleeps until the link is
+up and retires itself in AP mode. Its 3 KiB stack is what exposed the heap
+fragmentation that made the capture arena static (see Memory discipline).
+
+`XF16CAM_ESPHOME` (the `_esphome` suffix) compiles in `xf16cam_esphome.c`, an
+ESPHome native API server on TCP 6053 that Home Assistant's core ESPHome
+integration connects to directly, no broker: the same entity set as the MQTT
+discovery document (lights, PTZ and reboot buttons, binary/diagnostic/text
+sensors, the camera in browser media mode), state pushes on change and every
+60 s, light and button commands, and JPEG frames on request. The protocol
+was written from `api.proto` (ESPHome's C++ is GPLv3; nothing was ported
+from it): `xf16cam_esphome_proto.c` holds the protobuf helpers,
+`xf16cam_esphome_noise.c` the Noise_NNpsk0_25519_ChaChaPoly_SHA256 responder.
+It advertises API version 1.10 on purpose: at 1.14 the client stops sending
+object ids and at 1.15 it awaits a capabilities reply. Encryption: with no
+stored key the server accepts plaintext and Noise with the all-zero key, and
+device info says `api_encryption_supported` + `api_encryption_provisionable`,
+so Home Assistant generates a key and sends `NoiseEncryptionSetKeyRequest`;
+with a key only Noise is accepted (a plaintext client gets a `0x01` frame,
+which aioesphomeapi reports as "requires encryption"). The key is the
+integration block of the config record. Crypto cost is small because the
+WPA3 supplicant already keeps mbedtls ECP (Curve25519 included) and bignum
+in the image and SHA-256 is in the library too; ChaCha20-Poly1305 is not,
+because `libmbedtls.a` is built with `config-xr-mini-cliserv.h`
+(`src/net/mbedtls-2.16.0/Makefile`), so `xf16cam_esphome_mbedtls.c`
+compiles the three vendored sources into the app (included, not copied)
+with the options switched on in `xf16cam_esphome_mbedtls_config.h`, and
+pre-declares every function with `__xip_text` because `appos.ld` only
+places archives in XIP by name. **Any app file that touches mbedtls
+structures must define `MBEDTLS_CONFIG_FILE` to that header first**, or
+`mbedtls_mpi`/`mbedtls_ecp_group` have a different layout from the
+library's (mbedtls 2.16 cannot export Montgomery points, so the X25519
+public key is written from the X coordinate by hand, little-endian). Frames and
+camera chunks (1390 bytes, ESPHome's size) are built in one transmit buffer
+with 7 bytes of header room; the camera is held while a stream request is
+less than 5 s old, exactly ESPHome's expiry, so the stall watchdog never
+sees a held idle camera. Up to two clients (Home Assistant provisions the key
+over a second connection while the first is open); the task is created in
+`main()` next to the MQTT one, before the camera probe, for the same heap
+reason. `tools/xf16cam/esphome_check.py` (aioesphomeapi) exercises a device
+from a PC. `_esphome` builds are checked with `--xip-reserve 48K` and, since
+upstream's stack protector and crash detection took about 4 KB of XIP and
+3.4 KB of the compressed OTA image on every variant, `--ota-reserve 60K`
+(`ptz_esphome`: 17,384 / 55,652 / 63,092 free). They
+also need the SDK's lwIP listen PCB pool raised from 2 to 3: HTTP and RTSP
+hold the two the SDK allows, so the third `listen()` fails (reported as
+"listen failed" on the Network card and in `esphome.state`), and there is
+no project-side override because the define is unguarded and lwIP is
+compiled from the SDK tree. The SDK source in git is left alone:
+`patches/lwipopts.h.patch` changes the line at build time, applied with
+`patch -p1` by the Dockerfile and the workflow on `_esphome` builds only
+(keep the two in step), on their own copy of the tree, exactly like
+upstream's `patches/os_thread.c.patch`. A patch that no longer applies
+fails the build, so an SDK update cannot silently revert it.
 
 ## Memory discipline
 
@@ -176,6 +296,15 @@ habits are load-bearing:
   ~100 KiB JPEG buffer, and no YUV framebuffer. Frames are captured one at a
   time and each buffer stays immutable until fully transmitted, so a slow client
   can never observe a buffer mid-overwrite. Do not add a second frame buffer.
+  The arena is a **static array** (`g_capture_arena` in `main.c`), not a heap
+  allocation. Until v0.17.16 it was malloc'd on every cold camera acquire and
+  freed on release, and the SDK heap is first-fit over about 270 KB: once any
+  long-lived allocation (a client task stack, the MQTT task stack) landed in
+  the hole the freed arena left, the 104 KB block could never be served again
+  and every stream client failed with `malloc fail`. The static array costs
+  the same SRAM as holding the allocation, so the free-heap figure on the
+  System tab is about 104 KB lower than on older images, and it cannot fail.
+  Do not turn it back into a malloc.
 
 Sensor register tables live in XIP flash (`xf16cam_sensor_tables.c`, ~40 KB) and
 share one retrying SCCB writer. Adding a sensor means adding a descriptor plus a
@@ -220,7 +349,12 @@ probes the sensor, then **releases** camera power. Resources are demand-driven.
   to keep the previous session's last frame and any client arriving 30 s
   later was rebooted during the cold sensor re-init — the older unconditional
   2-hour reboot is commented out, leave it that way) and, on PTZ builds,
-  **day/night switching** from a CDS sensor on ADC5 every 5 s.
+  **day/night switching** from a CDS sensor on ADC5 every 5 s. The ADC is
+  shared with the battery measurement through
+  `xf16cam_board_adc_acquire/release()`: a second `HAL_ADC_Init` while the
+  first is live fails (`ADC state: 3`), which broke the Measure button once
+  the CDS check stopped re-initialising per cycle, and a `HAL_ADC_DeInit`
+  from the battery path would have taken the converter from under it.
 - **`xf16cam_audio.c`** — on-demand AMIC capture; publishes PCMU silence during
   the 2.1 s analogue settling window so the media clock stays intact.
 - **`xf16cam_storage.c`**, **`xf16cam_power.c`**, **`xf16cam_ptz.c`**,
@@ -230,17 +364,43 @@ probes the sensor, then **releases** camera power. Resources are demand-driven.
   IGMP out of the image without touching the SDK (see Build).
 - **`xf16cam_log.c`** — `XF16CAM_NETLOG` only: console mirror to a RAM ring,
   UDP broadcast and `/api/log` (see Build).
+- **`xf16cam_mqtt.c` + `xf16cam_mqtt_payload.c`** — `XF16CAM_MQTT` only: the
+  Home Assistant MQTT client (see Build) and its host-tested payload
+  generators. It takes frames through `xf16cam_media_snapshot_begin/end()`
+  in `main.c`, which acquire the camera and the capture lock around one
+  `xf16cam_capture_jpeg()` exactly as an MJPEG client does.
+- **`xf16cam_esphome.c`, `xf16cam_esphome_proto.c`, `xf16cam_esphome_noise.c`
+  and `xf16cam_esphome_mbedtls.c`** — `XF16CAM_ESPHOME` only: the ESPHome
+  native API server (see Build), its host-tested protobuf and Noise modules,
+  and the ChaCha20-Poly1305 build of the vendored mbedtls sources. Frames go
+  through the same snapshot pair as the MQTT client.
 
 The DHCP hostname is `XF16CAM-<last three eFuse MAC bytes>`, built once in
 `xf16cam_net_start()` before `net_switch_mode()` and handed to the SDK's
 `ethernetif_set_hostname()`. It is deliberately not configurable: the eFuse MAC
 makes it unique per board from a single firmware image, with no provisioning
-step and nothing an OTA or a reflash can overwrite. Adding an editable name
-would mean growing `XF16CamConfig`, and `xf16cam_config_storage_valid()` rejects
-any record whose `length` differs from `sizeof(XF16CamConfig)` — so that change
-needs a real schema-3 migration or it silently resets every device to AP mode.
-Flash is fully allocated (settings at 1016 KiB, SDK sysinfo at 1020 KiB), so
-there is no spare sector to store it in separately.
+step and nothing an OTA or a reflash can overwrite. It doubles as the MQTT
+client id and topic id.
+
+`XF16CamConfig` is at schema 3 (220 bytes): the 116-byte schema 1/2 record,
+then at offset 109 a `feature` tag naming the integration variant that wrote
+the record (`XF16CAM_FEATURE_NONE`, `_MQTT` = 'M', `_ESPHOME` = 'E') and at
+112 a 104-byte union holding that variant's block (`u.mqtt` on `_mqtt`
+builds). Every variant shares the one layout, but a record never holds more
+than one integration's fields: `xf16cam_config_adopt_block()` clears the
+block and rewrites the tag when it was written by a different variant or is
+corrupt, so an OTA between `_mqtt`, `_esphome` and plain images keeps Wi-Fi,
+media mode and resolution and only the integration has to be set up again.
+`xf16cam_config_storage_valid()` checks the shared prefix and still rejects
+any record whose `length` differs from `sizeof(XF16CamConfig)`;
+`xf16cam_config_load_legacy()` is what keeps that from resetting devices to
+AP mode: it reads a 116-byte record, checks it with its own checksum span,
+copies the byte-identical prefix and rewrites it as schema 3. A block that
+outgrows 104 bytes cannot just grow the union: the FDCM reader refuses a read
+whose size differs from the stored record, so that needs a fixed-size
+envelope or a raw header read, plus the legacy dance (a new legacy length and
+checksum offset). Flash is fully allocated (settings at 1016 KiB, SDK sysinfo
+at 1020 KiB), so there is no spare sector for anything else.
 
 A missing or unsupported sensor is non-fatal by design: Wi-Fi, HTTP, OTA, audio,
 SD, and diagnostics all stay up while video reports the camera offline. Preserve
@@ -284,12 +444,19 @@ full). RTSP: `rtsp://<device-ip>:8554/stream` — force TCP transport in VLC, or
 `-rtsp_transport tcp` with ffplay.
 
 JSON reads: `GET /api/scan`, `/api/audio`, `/api/led`, `/api/ir_led`, and
-`/api/system` (every System/Live/Storage diagnostic in one streamed response).
-`GET /api/log` (`XF16CAM_NETLOG` builds only) returns the last 2 KiB of
-console output as text.
+`/api/system` (every System/Live/Storage diagnostic in one streamed response;
+`XF16CAM_MQTT` builds add an `mqtt` object with the broker, counters and the
+task's spare stack, never the password; `XF16CAM_ESPHOME` builds an `esphome`
+object with task state, client count, encryption and key state, counters and
+spare stack, never the key). `GET /api/log` (`XF16CAM_NETLOG` builds only)
+returns the last 2 KiB of console output as text.
 
-Form-encoded writes: `POST /api/wifi`, `/api/ap`, `/api/media`, `/api/resolution`
-(these reboot), `/api/led`, `/api/ir_led`, `/api/ptz` (`mode=up|down|left|right|home`,
+Form-encoded writes: `POST /api/wifi`, `/api/ap`, `/api/media`, `/api/resolution`,
+`/api/mqtt` (`XF16CAM_MQTT` only: `host`, `port`, `user`, `pass`, `interval`;
+blank `host` disables, blank `pass` keeps the saved one for the same host)
+(these reboot), `/api/esphome` (`XF16CAM_ESPHOME` only, no reboot:
+`action=generate` stores a fresh Noise key and shows it once, `action=clear`
+drops it so Home Assistant provisions a new one), `/api/led`, `/api/ir_led`, `/api/ptz` (`mode=up|down|left|right|home`,
 501 under `NO_PTZ`), `/api/power` (measure battery), `/api/hibernate` (`NO_PTZ`
 only; PTZ builds have neither the route nor the button, so it is a 404 there),
 `/api/sd/refresh`, `/api/sd/eject`, `/api/sd/format`, `/api/reboot` (both
