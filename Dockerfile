@@ -45,16 +45,22 @@ RUN printf '%s\n' \
 RUN patch -p1 < patches/os_thread.c.patch
 
 # Build flash and OTA images. Pass BUILD_VARIANT=no_ptz for the fixed-camera
-# board; the default PTZ build leaves NO_PTZ undefined. A _netlog suffix adds
-# XF16CAM_NETLOG, the UDP console mirror (see xf16cam_log.c).
+# board; the default PTZ build leaves NO_PTZ undefined. Optional suffixes, in
+# this order: _talk adds XF16CAM_TALK, the RTSP audio backchannel to the
+# speaker; _netlog adds XF16CAM_NETLOG, the UDP console mirror (see
+# xf16cam_log.c). So ptz, ptz_talk, ptz_netlog, ptz_talk_netlog and the
+# no_ptz equivalents.
 RUN variant="$BUILD_VARIANT"; symbols=""; \
     case "$variant" in \
     *_netlog) symbols="-DXF16CAM_NETLOG"; variant="${variant%_netlog}" ;; \
     esac; \
     case "$variant" in \
+    *_talk) symbols="-DXF16CAM_TALK $symbols"; variant="${variant%_talk}" ;; \
+    esac; \
+    case "$variant" in \
     ptz) ;; \
-    no_ptz) symbols="$symbols -DNO_PTZ" ;; \
-    *) echo "Invalid BUILD_VARIANT: $BUILD_VARIANT (use ptz or no_ptz, optionally with _netlog)" >&2; exit 1 ;; \
+    no_ptz) symbols="-DNO_PTZ $symbols" ;; \
+    *) echo "Invalid BUILD_VARIANT: $BUILD_VARIANT (use ptz or no_ptz, optionally with _talk and/or _netlog)" >&2; exit 1 ;; \
     esac \
     && make -C project/example/xf16cam/gcc \
     CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")" \

@@ -50,7 +50,16 @@
 #define XF16CAM_RTP_AUDIO_SSRC   (0x58463137UL)
 #define XF16CAM_RTSP_HANDSHAKE_MS (10000U)
 #define XF16CAM_RTSP_IO_TIMEOUT_MS (2000)
+#ifdef XF16CAM_TALK
+/* The ONVIF backchannel adds a third SDP track and a fourth channel pair;
+ * the reply buffers and the client stack grow with it. */
+#define XF16CAM_RTSP_CLIENT_STACK (3 * 1024 + 512)
+#define XF16CAM_RTSP_SDP_SIZE     (384)
+__xip_rodata static const char g_backchannel_feature[] = "www.onvif.org/ver20/backchannel";
+#else
 #define XF16CAM_RTSP_CLIENT_STACK (3 * 1024)
+#define XF16CAM_RTSP_SDP_SIZE     (256)
+#endif
 
 _Static_assert(JPEG_SRAM_SIZE >= JPEG_BUFFER_COUNT *
 	       (JPEG_BUFF_SIZE + CAMERA_JPEG_HEADER_LEN + 1023U),
@@ -596,6 +605,11 @@ typedef struct {
 	uint8_t video_setup;
 	uint8_t audio_setup;
 	uint8_t audio_acquired;
+#ifdef XF16CAM_TALK
+	uint8_t talk_channel;
+	uint8_t talk_offered;	/* DESCRIBE carried the ONVIF backchannel Require */
+	uint8_t talk_setup;	/* track3 set up; also holds the talk slot */
+#endif
 } XF16CamRtspSession;
 
 static int xf16cam_send_rtp_jpeg(int fd, const XF16CamJpeg *jpg,
@@ -773,7 +787,7 @@ static int xf16cam_rtsp_reply(int fd, const char *request, const char *ip,
 			      XF16CamRtspSession *session)
 {
 	char response[768];
-	char sdp[256];
+	char sdp[XF16CAM_RTSP_SDP_SIZE];
 	int cseq = xf16cam_cseq(request);
 	int n;
 
@@ -782,13 +796,31 @@ static int xf16cam_rtsp_reply(int fd, const char *request, const char *ip,
 			               "RTSP/1.0 200 OK\r\nCSeq: %d\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n",
 			               cseq);
 	} else if (!strncmp(request, "DESCRIBE ", 9)) {
-		int sdp_len = XF16CAM_XIP_FORMAT(sdp, sizeof(sdp),
+		const char *talk_track = "";
+		int sdp_len;
+#ifdef XF16CAM_TALK
+		/* ONVIF Streaming Spec: a client asking for the audio backchannel
+		 * sends Require: www.onvif.org/ver20/backchannel and gets an extra
+		 * a=sendonly audio track it will send PCMU into. */
+		__xip_rodata static const char backchannel_sdp[] =
+			"m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000/1\r\na=control:track3\r\na=sendonly\r\n";
+		const char *require;
+		size_t require_length;
+
+		session->talk_offered = xf16cam_talk_info()->available &&
+			xf16cam_rtsp_header_value(request, "Require", &require, &require_length) == 1 &&
+			xf16cam_rtsp_contains_ci(require, require_length, g_backchannel_feature);
+		if (session->talk_offered)
+			talk_track = backchannel_sdp;
+#endif
+		sdp_len = XF16CAM_XIP_FORMAT(sdp, sizeof(sdp),
 			"v=0\r\no=- 0 0 IN IP4 %s\r\ns=XF16 %s\r\nc=IN IP4 %s\r\nt=0 0\r\n"
 			"m=video 0 RTP/AVP 26\r\na=rtpmap:26 JPEG/90000\r\na=control:track1\r\n"
-			"%s",
+			"%s%s",
 			ip, xf16cam_sensor_name(), ip,
 			session->audio_available ?
-			"m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000/1\r\na=control:track2\r\n" : "");
+			"m=audio 0 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000/1\r\na=control:track2\r\n" : "",
+			talk_track);
 		n = XF16CAM_XIP_FORMAT(response, sizeof(response),
 			               "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Base: rtsp://%s:%u/stream/\r\n"
 			               "Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s",
@@ -799,18 +831,37 @@ static int xf16cam_rtsp_reply(int fd, const char *request, const char *ip,
 	} else if (!strncmp(request, "SETUP ", 6)) {
 		int video = strstr(request, "track1") != NULL;
 		int audio = strstr(request, "track2") != NULL;
+		int talk = 0;
 		uint8_t *channel = audio ? &session->audio_channel : &session->video_channel;
 		uint8_t requested_channel;
-		if (video == audio || (audio && !session->audio_available) ||
-		    xf16cam_rtsp_channels(request, audio ? 2 : 0, &requested_channel) != 0 ||
-		    (audio && session->video_setup &&
+		int invalid;
+#ifdef XF16CAM_TALK
+		talk = strstr(request, "track3") != NULL && session->talk_offered;
+		if (talk)
+			channel = &session->talk_channel;
+#endif
+		invalid = video + audio + talk != 1 || (audio && !session->audio_available) ||
+		    xf16cam_rtsp_channels(request, talk ? 4 : audio ? 2 : 0, &requested_channel) != 0 ||
+		    (!video && session->video_setup &&
 		     xf16cam_rtsp_channels_overlap(requested_channel, session->video_channel)) ||
-		    (video && session->audio_setup &&
-		     xf16cam_rtsp_channels_overlap(requested_channel, session->audio_channel))) {
+		    (!audio && session->audio_setup &&
+		     xf16cam_rtsp_channels_overlap(requested_channel, session->audio_channel));
+#ifdef XF16CAM_TALK
+		if (!invalid && !talk && session->talk_setup &&
+		    xf16cam_rtsp_channels_overlap(requested_channel, session->talk_channel))
+			invalid = 1;
+#endif
+		if (invalid) {
 			n = XF16CAM_XIP_FORMAT(response, sizeof(response),
 			                       "RTSP/1.0 400 Bad Request\r\nCSeq: %d\r\n\r\n", cseq);
 		} else {
-			if (audio && !session->audio_acquired && xf16cam_audio_acquire() != 0) {
+			int busy = audio && !session->audio_acquired && xf16cam_audio_acquire() != 0;
+#ifdef XF16CAM_TALK
+			/* One talker per device: a second backchannel SETUP gets 503. */
+			if (talk && !session->talk_setup && xf16cam_talk_acquire() != 0)
+				busy = 1;
+#endif
+			if (busy) {
 				n = XF16CAM_XIP_FORMAT(response, sizeof(response),
 				                       "RTSP/1.0 503 Service Unavailable\r\nCSeq: %d\r\n\r\n",
 				                       cseq);
@@ -819,6 +870,10 @@ static int xf16cam_rtsp_reply(int fd, const char *request, const char *ip,
 				if (audio) {
 					session->audio_acquired = 1;
 					session->audio_setup = 1;
+#ifdef XF16CAM_TALK
+				} else if (talk) {
+					session->talk_setup = 1;
+#endif
 				} else {
 					session->video_setup = 1;
 				}
@@ -873,28 +928,62 @@ __xip_text
 static int xf16cam_rtsp_receive(int fd, XF16CamRtspParser *parser,
 				const char **request, int nonblocking)
 {
-	size_t writable;
-	int ready = xf16cam_rtsp_parser_next(parser, request);
-	int received;
+#ifdef XF16CAM_TALK
+	/* Backchannel audio arrives at 50 frames/s while this only runs between
+	 * video frames, so keep draining until the socket runs dry. */
+	int attempts = nonblocking ? 8 : 1;
+#else
+	int attempts = 1;
+#endif
 
-	if (ready != 0)
-		return ready;
-	writable = xf16cam_rtsp_parser_writable(parser);
-	if (writable == 0)
-		return -1;
-	received = recv(fd, xf16cam_rtsp_parser_write_ptr(parser), writable,
-	                nonblocking ? MSG_DONTWAIT : 0);
-	if (received > 0) {
-		if (xf16cam_rtsp_parser_commit(parser, (size_t)received) != 0)
+	while (attempts-- > 0) {
+		size_t writable;
+		int ready = xf16cam_rtsp_parser_next(parser, request);
+		int received;
+
+		if (ready != 0)
+			return ready;
+		writable = xf16cam_rtsp_parser_writable(parser);
+		if (writable == 0)
 			return -1;
-		return xf16cam_rtsp_parser_next(parser, request);
-	}
-	if (received == 0)
+		received = recv(fd, xf16cam_rtsp_parser_write_ptr(parser), writable,
+		                nonblocking ? MSG_DONTWAIT : 0);
+		if (received > 0) {
+			if (xf16cam_rtsp_parser_commit(parser, (size_t)received) != 0)
+				return -1;
+			ready = xf16cam_rtsp_parser_next(parser, request);
+			if (ready != 0 || attempts == 0)
+				return ready;
+			continue;
+		}
+		if (received == 0)
+			return -1;
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+			return 0;
 		return -1;
-	if (errno == EAGAIN || errno == EWOULDBLOCK)
-		return 0;
-	return -1;
+	}
+	return 0;
 }
+
+#ifdef XF16CAM_TALK
+/* Interleaved frames from the client: RTCP is ignored, RTP on the backchannel
+ * data channel is unwrapped and queued for the speaker. */
+__xip_text
+static void xf16cam_rtsp_talk_frame(void *context, uint8_t channel,
+				    const uint8_t *frame, size_t length)
+{
+	XF16CamRtspSession *session = context;
+	size_t offset;
+	size_t payload;
+
+	if (!session->talk_setup || channel != session->talk_channel)
+		return;
+	if (xf16cam_rtp_payload(frame, length, &offset, &payload) != 0 ||
+	    (frame[1] & 0x7f) != 0 || payload == 0)
+		return;	/* not PCMU, or malformed */
+	xf16cam_talk_push(frame + offset, (uint32_t)payload);
+}
+#endif
 
 static int xf16cam_stream_client(int fd, const char *ip)
 {
@@ -910,11 +999,15 @@ static int xf16cam_stream_client(int fd, const char *ip)
 	int send_timeout = XF16CAM_RTSP_IO_TIMEOUT_MS;
 	int playing = 0;
 	int camera_acquired = 0;
+	const char *talk_note = "";
 
 	/* DESCRIBE needs capability, not an active codec. Defer the camera rail,
 	 * capture arena, and AMIC until the client actually selects their tracks. */
 	session.audio_available = xf16cam_audio_info()->available != 0;
 	xf16cam_rtsp_parser_init(&parser);
+#ifdef XF16CAM_TALK
+	xf16cam_rtsp_parser_set_sink(&parser, xf16cam_rtsp_talk_frame, &session);
+#endif
 	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout));
 	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
 	while (!playing && !xf16cam_update_active()) {
@@ -949,8 +1042,12 @@ static int xf16cam_stream_client(int fd, const char *ip)
 	if (!playing)
 		goto stopped;
 
-	printf("xf16cam PLAY: RTP/JPEG%s over RTSP TCP\n",
-	       session.audio_setup ? " + PCMU/8000" : "");
+#ifdef XF16CAM_TALK
+	if (session.talk_setup)
+		talk_note = " + PCMU backchannel";
+#endif
+	printf("xf16cam PLAY: RTP/JPEG%s%s over RTSP TCP\n",
+	       session.audio_setup ? " + PCMU/8000" : "", talk_note);
 	while (!xf16cam_update_active()) {
 		CAMERA_JpegBuffInfo info;
 		XF16CamJpeg jpg;
@@ -1012,6 +1109,10 @@ static int xf16cam_stream_client(int fd, const char *ip)
 	}
 
 stopped:
+#ifdef XF16CAM_TALK
+	if (session.talk_setup)
+		xf16cam_talk_release();
+#endif
 	if (session.audio_acquired)
 		xf16cam_audio_release();
 	if (camera_acquired)

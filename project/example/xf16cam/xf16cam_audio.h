@@ -24,4 +24,25 @@ uint32_t xf16cam_audio_cursor(void);
 int xf16cam_audio_read(uint32_t *cursor, uint8_t *pcmu, uint32_t *timestamp);
 uint32_t xf16cam_audio_stack_min_free(void);
 
+#ifdef XF16CAM_TALK
+/* Speaker playback for the RTSP audio backchannel (ONVIF Profile T style).
+ * PCMU/8000 pushed by one talker at a time is decoded and written to the
+ * XR872 internal codec line-out; the microphone is silenced while the
+ * remote side is talking because the SDK has no echo cancellation. */
+typedef struct {
+	uint32_t packets;    /* RTP payloads accepted into the ring */
+	uint32_t dropped;    /* payloads discarded because the ring was full */
+	uint32_t underruns;  /* silent frames written while the DAC was open */
+	uint32_t errors;     /* snd_pcm_write failures */
+	uint8_t available;
+	uint8_t active;      /* DAC open */
+} XF16CamTalkInfo;
+
+int xf16cam_talk_acquire(void);
+void xf16cam_talk_release(void);
+int xf16cam_talk_push(const uint8_t *pcmu, uint32_t length);
+const XF16CamTalkInfo *xf16cam_talk_info(void);
+uint32_t xf16cam_talk_stack_min_free(void);
+#endif
+
 #endif

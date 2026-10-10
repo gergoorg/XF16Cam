@@ -33,7 +33,7 @@ lint step and no test runner beyond one host-compiled unit test.
 Windows (Docker, produces `dist/`):
 
 ```bat
-buildXF16Cam.bat ptz      REM or: no_ptz, ptz_netlog, no_ptz_netlog
+buildXF16Cam.bat ptz      REM or: no_ptz, ptz_talk, ptz_netlog, ptz_talk_netlog, ...
 ```
 
 Linux/CI-equivalent, with `arm-none-eabi-gcc` on `PATH`:
@@ -43,7 +43,8 @@ printf '%s\n' '__CONFIG_CHIP_TYPE ?= xr872' '__CONFIG_HOSC_TYPE ?= 40' > .config
 chmod +x tools/mkimage
 make -C project/example/xf16cam/gcc \
   CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")" \
-  PRJ_EXTRA_SYMBOLS="" image      # add -DNO_PTZ for the fixed-camera board
+  PRJ_EXTRA_SYMBOLS="" image      # add -DNO_PTZ for the fixed-camera board,
+                                  # -DXF16CAM_TALK for the RTSP audio backchannel
 make -C project/example/xf16cam/gcc \
   CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")" \
   PRJ_EXTRA_SYMBOLS="" image_xz
@@ -118,20 +119,44 @@ The absent sentinels prove the lwIP link-out still takes effect after an SDK
 update. `flashc_suspend`, the flash controller's PM hook, must be in SRAM on
 both variants: power management cannot be compiled out (see Build).
 
-CI builds `ptz`, `no_ptz` and `ptz_netlog`; a change must compile under all
-of them. `-DXF16CAM_NETLOG` (the `_netlog` suffix) compiles in the console
-mirror: `xf16cam_log.c` installs its own libc stdout writer, so every
-`printf` in the system still reaches the UART and is also kept in a 2 KiB
-RAM ring that the board task broadcasts over UDP port 5514 and `GET /api/log`
-returns as text. It exists because the board has no serial connection
-without disassembly; `tools/xf16cam/udplog.py` is the PC side. The writer
-itself must stay in SRAM (no `__xip_text`), since printf runs while flash is
-disabled during OTA and settings writes. Nothing survives a reset, so every
-deliberate reboot calls `xf16cam_log_flush()` first and the reason it printed
-leaves the board; a hard fault does not reboot at all (the ROM handler halts,
-and the hardware watchdog is not enabled), so a silent hang with no boot
-marker is a crash. Measured cost on `ptz`: 120 bytes of app slot, 376 bytes
-of XIP, plus the 2 KiB ring in `.bss`.
+The variant name is `ptz` or `no_ptz` plus optional suffixes, in this order:
+`_talk`, then `_netlog`. CI builds `ptz`, `no_ptz`, `ptz_talk`, `no_ptz_talk`
+and `ptz_talk_netlog`; a change must compile under all of them.
+
+`XF16CAM_TALK` (the `_talk` suffix) adds speaker playback for the RTSP audio
+backchannel. It is opt-in because it costs flash and because it swaps the
+board config: the SDK's evaluation-board file drives PA23 high as a
+speaker-amplifier enable, but on the XF16 PA23 is the camera/SD rail and the
+amplifier enable is **PB21, active low**. That pin is not on any pin map; it
+was read out of the factory (Z-IoT) firmware, whose "talk open spk" routine
+writes PB21 low and "talk close spk" writes it high (`HAL_GPIO_WritePin` is
+in ROM, so the call is unambiguous in a disassembly). Talk builds therefore
+link `project/example/xf16cam/board/`, a copy of
+`project/common/board/xr872_evb_ai` whose only change is that PA-switch
+entry (`GPIO_PORT_B`, `GPIO_PIN_21`, `on_state = GPIO_PIN_LOW`) on the
+internal codec; the SDK sound card then drives the pin around every
+`PCM_OUT` open and close and never for capture. The Makefile picks the copy
+when `PRJ_EXTRA_SYMBOLS` contains `XF16CAM_TALK`, and non-talk builds keep
+the SDK file. Re-copy and re-apply that one change when the SDK board config
+is updated. The codec itself was verified to be blameless before that pin was
+found: the DAC FIFO counter, a register dump against the XR872 user manual
+and the line-out-to-line-in loopback all checked out with the speaker still
+silent, so do not go back down that path if the speaker ever goes quiet
+again; check PB21 first.
+
+`XF16CAM_NETLOG` (the `_netlog` suffix) compiles in the console mirror:
+`xf16cam_log.c` installs its own libc stdout writer, so every `printf` in the
+system still reaches the UART and is also kept in a 2 KiB RAM ring that the
+board task broadcasts over UDP port 5514 and `GET /api/log` returns as text.
+It exists because the board has no serial connection without disassembly;
+`tools/xf16cam/udplog.py` is the PC side. The writer itself must stay in SRAM
+(no `__xip_text`), since printf runs while flash is disabled during OTA and
+settings writes. Nothing survives a reset, so every deliberate reboot calls
+`xf16cam_log_flush()` first and the reason it printed leaves the board; a
+hard fault does not reboot at all (the ROM handler halts, and the hardware
+watchdog is not enabled), so a silent hang with no boot marker is a crash.
+Measured cost on
+`ptz`: 120 bytes of app slot, 376 bytes of XIP, plus the 2 KiB ring in `.bss`.
 
 ## Memory discipline
 
@@ -161,7 +186,10 @@ habits are load-bearing:
   and 64 KiB; `no_ptz` has 20,248 / 79,588 / 78,584. Moving more from the app
   slot into XIP only shifts which gate trips first. What adds real room is
   removing things, as the link-out does, or revisiting the floors, not further
-  relocation.
+  relocation. The `XF16CAM_TALK` backchannel costs about 500 bytes of app
+  slot and 2.1 KB of XIP on top of that (`ptz_talk` 0.17.16: 20,184 /
+  75,228 / 76,556; `no_ptz_talk` 19,752 / 77,332 / 77,060), plus a 4 KiB
+  playback ring in `.bss`.
 - The macros keep gcc's `-Wformat` checking: GCC 8 follows a `static const
   char[]` initialised from a literal, so a mismatched argument still warns, as
   verified with the project toolchain. Read the build log, though, since the
@@ -222,7 +250,12 @@ probes the sensor, then **releases** camera power. Resources are demand-driven.
   2-hour reboot is commented out, leave it that way) and, on PTZ builds,
   **day/night switching** from a CDS sensor on ADC5 every 5 s.
 - **`xf16cam_audio.c`** — on-demand AMIC capture; publishes PCMU silence during
-  the 2.1 s analogue settling window so the media clock stays intact.
+  the 2.1 s analogue settling window so the media clock stays intact. Under
+  `XF16CAM_TALK` it also owns speaker playback: a lock-free single-producer
+  PCMU ring fed by `xf16cam_talk_push()`, a playback task that opens the codec
+  output once 200 ms is buffered and closes it 1.5 s after the last packet,
+  and half-duplex muting of the microphone while the speaker plays (no echo
+  canceller exists). `xf16cam_talk_acquire()` admits one talker at a time.
 - **`xf16cam_storage.c`**, **`xf16cam_power.c`**, **`xf16cam_ptz.c`**,
   **`xf16cam_net.c`**, **`xf16cam_rail.c`** — SD card, PA16 battery ADC and
   hibernation, PTZ motion, Wi-Fi bring-up, shared rail refcount.
@@ -300,6 +333,18 @@ leaves the running firmware bootable).
 
 Handlers return `XF16CAM_HTTP_KEEP_RUNNING` or signal a reboot; errors go through
 `xf16cam_http_message(fd, status, text)`.
+
+RTSP backchannel (`XF16CAM_TALK` builds): a DESCRIBE carrying
+`Require: www.onvif.org/ver20/backchannel` gets a third, `a=sendonly`
+PCMU/8000 track (`track3`); SETUP of it claims the single talk slot (503 when
+taken) and the client pushes interleaved RTP on that channel. The parser hands
+complete binary frames to a sink (`xf16cam_rtsp_parser_set_sink()`), and
+`xf16cam_rtp_payload()` unwraps the RTP header; both are host-tested. The
+session thread drains the socket only between video frames, which is why the
+playback ring is 512 ms and why `xf16cam_rtsp_receive()` reads up to eight
+times per pass on talk builds. `/api/system` gains a `talk` object and the
+System tab an Audio-card Speaker row. `tools/xf16cam/rtsp_talk.py` is a
+scripted client; `tests/xf16cam/talk-go2rtc-test-plan.md` is the device test.
 
 **The setup AP is unauthenticated by design** and so is the API — anyone in radio
 range can reach every endpoint above while AP mode is active. Keep that in mind

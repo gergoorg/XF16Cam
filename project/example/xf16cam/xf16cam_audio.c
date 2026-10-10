@@ -19,6 +19,19 @@
 #define XF16CAM_AUDIO_MIC_LEVEL     (VOLUME_LEVEL3)
 #define XF16CAM_AUDIO_WARMUP_PACKETS (105)
 
+#ifdef XF16CAM_TALK
+/* Ring sizes are bytes of PCMU/8000, i.e. milliseconds times eight. The RTSP
+ * session thread only drains its socket between video frames, so the ring
+ * must ride out a few frame periods and playback starts only once
+ * XF16CAM_TALK_PRIME_BYTES are buffered. */
+#define XF16CAM_TALK_RING_BYTES     (4096U)
+#define XF16CAM_TALK_PRIME_BYTES    (1600U)
+#define XF16CAM_TALK_STACK_SIZE     (1536)
+#define XF16CAM_TALK_IDLE_MS        (1500U)
+#define XF16CAM_TALK_MUTE_MS        (500U)
+#define XF16CAM_TALK_VOLUME         (VOLUME_LEVEL31)	/* line-out gain: 31 is 0 dB, -1.5 dB per step */
+#endif
+
 typedef struct {
 	OS_Thread_t thread;
 	volatile int active;
@@ -41,6 +54,114 @@ static volatile uint32_t g_audio_users;
 static XF16CamAudioHttpClient g_audio_http_clients[XF16CAM_MAX_PARALLEL_CLIENTS];
 static volatile uint32_t g_audio_http_clients_active;
 static volatile int g_audio_update_quiesced = 1;
+
+#ifdef XF16CAM_TALK
+static OS_Thread_t g_talk_thread;
+static uint8_t g_talk_ring[XF16CAM_TALK_RING_BYTES];
+/* Single producer (the one RTSP session holding the talk slot), single
+ * consumer (the playback task): monotonic byte counters, no lock. */
+static volatile uint32_t g_talk_head;
+static volatile uint32_t g_talk_tail;
+static volatile uint32_t g_talk_users;
+static volatile uint32_t g_talk_last_ms;
+static volatile int g_talk_quiesced = 1;
+static XF16CamTalkInfo g_talk_info;
+
+/* ITU-T G.711 mu-law decoder. */
+__xip_text
+static int16_t xf16cam_mulaw_decode(uint8_t encoded)
+{
+	uint8_t value = (uint8_t)~encoded;
+	int sample = (((value & 0x0f) << 3) + 0x84) << ((value >> 4) & 0x07);
+
+	sample -= 0x84;
+	return (int16_t)((value & 0x80) ? -sample : sample);
+}
+
+/* Half-duplex: the microphone is silenced while the speaker is playing so a
+ * talker does not hear their own voice back; the SDK has no echo canceller. */
+__xip_text
+static int xf16cam_talk_muting(void)
+{
+	return g_talk_info.active &&
+	       OS_TicksToMSecs(OS_GetTicks()) - g_talk_last_ms < XF16CAM_TALK_MUTE_MS;
+}
+
+__xip_text
+static void xf16cam_talk_task(void *arg)
+{
+	struct pcm_config config;
+	int16_t pcm[XF16CAM_AUDIO_SAMPLES_PER_PACKET];
+	int opened = 0;
+	(void)arg;
+
+	memset(&config, 0, sizeof(config));
+	config.channels = 1;
+	config.format = PCM_FORMAT_S16_LE;
+	config.period_count = 4;
+	config.period_size = XF16CAM_AUDIO_SAMPLES_PER_PACKET;
+	config.rate = XF16CAM_AUDIO_RATE;
+	g_talk_info.available = 1;
+	printf("xf16cam talk: speaker ready; playback starts on demand\n");
+	while (1) {
+		uint32_t now = OS_TicksToMSecs(OS_GetTicks());
+		uint32_t buffered = g_talk_head - g_talk_tail;
+		int stopping = xf16cam_update_active() || g_talk_users == 0;
+		int i;
+
+		if (stopping || (buffered < XF16CAM_AUDIO_SAMPLES_PER_PACKET &&
+		                 now - g_talk_last_ms > XF16CAM_TALK_IDLE_MS)) {
+			if (opened) {
+				snd_pcm_close(AUDIO_SND_CARD_DEFAULT, PCM_OUT);
+				opened = 0;
+				g_talk_info.active = 0;
+				printf("xf16cam talk: speaker off\n");
+			}
+			g_talk_quiesced = 1;
+			if (stopping)
+				g_talk_tail = g_talk_head;	/* discard stale audio */
+			OS_MSleep(20);
+			continue;
+		}
+		if (!opened) {
+			if (buffered < XF16CAM_TALK_PRIME_BYTES) {
+				OS_MSleep(10);
+				continue;
+			}
+			g_talk_quiesced = 0;
+			audio_manager_handler(AUDIO_SND_CARD_DEFAULT, AUDIO_MANAGER_SET_VOLUME_LEVEL,
+			                      AUDIO_OUT_DEV_SPK, XF16CAM_TALK_VOLUME);
+			if (snd_pcm_open(AUDIO_SND_CARD_DEFAULT, PCM_OUT, &config) != 0) {
+				printf("xf16cam talk: speaker open failed\n");
+				g_talk_info.available = 0;
+				g_talk_quiesced = 1;
+				OS_ThreadDelete(&g_talk_thread);
+				return;
+			}
+			opened = 1;
+			g_talk_info.active = 1;
+			printf("xf16cam talk: speaker on, PCMU/8000 backchannel\n");
+		}
+		if (buffered >= XF16CAM_AUDIO_SAMPLES_PER_PACKET) {
+			uint32_t tail = g_talk_tail;
+
+			for (i = 0; i < XF16CAM_AUDIO_SAMPLES_PER_PACKET; ++i)
+				pcm[i] = xf16cam_mulaw_decode(
+					g_talk_ring[(tail + (uint32_t)i) & (XF16CAM_TALK_RING_BYTES - 1U)]);
+			__sync_synchronize();
+			g_talk_tail = tail + XF16CAM_AUDIO_SAMPLES_PER_PACKET;
+		} else {
+			/* Keep the DAC clocked through a jitter gap. */
+			memset(pcm, 0, sizeof(pcm));
+			g_talk_info.underruns++;
+		}
+		if (snd_pcm_write(AUDIO_SND_CARD_DEFAULT, pcm, sizeof(pcm)) != (int)sizeof(pcm)) {
+			g_talk_info.errors++;
+			OS_MSleep(20);
+		}
+	}
+}
+#endif
 
 static int xf16cam_audio_send_all(int fd, const void *data, uint32_t length)
 {
@@ -155,6 +276,10 @@ static void xf16cam_audio_task(void *arg)
 			memset(slot->pcmu, 0xff, sizeof(slot->pcmu));
 			if (--warmup_packets == 0)
 				printf("xf16cam audio: AMIC settled, live PCMU/8000 audio\n");
+#ifdef XF16CAM_TALK
+		} else if (xf16cam_talk_muting()) {
+			memset(slot->pcmu, 0xff, sizeof(slot->pcmu));
+#endif
 		} else {
 			for (i = 0; i < XF16CAM_AUDIO_SAMPLES_PER_PACKET; ++i) {
 				uint16_t magnitude = pcm[i] == INT16_MIN ? 32768U :
@@ -192,6 +317,12 @@ int xf16cam_audio_start(void)
 		g_audio_lock_ready = 0;
 		return -1;
 	}
+#ifdef XF16CAM_TALK
+	/* A failure here leaves talk unavailable; capture is unaffected. */
+	if (OS_ThreadCreate(&g_talk_thread, "xf16cam-talk", xf16cam_talk_task, NULL,
+	                    OS_THREAD_PRIO_APP, XF16CAM_TALK_STACK_SIZE) != OS_OK)
+		printf("xf16cam talk: task start failed\n");
+#endif
 	return 0;
 }
 
@@ -294,7 +425,12 @@ fail_slot:
 
 int xf16cam_audio_update_ready(void)
 {
-	return g_audio_update_quiesced && g_audio_http_clients_active == 0;
+	int ready = g_audio_update_quiesced && g_audio_http_clients_active == 0;
+
+#ifdef XF16CAM_TALK
+	ready = ready && g_talk_quiesced;
+#endif
+	return ready;
 }
 
 const XF16CamAudioInfo *xf16cam_audio_info(void)
@@ -333,3 +469,69 @@ uint32_t xf16cam_audio_stack_min_free(void)
 {
 	return OS_ThreadGetStackMinFreeSize(&g_audio_thread);
 }
+
+#ifdef XF16CAM_TALK
+/* One talker at a time: the ring is single-producer, and two clients
+ * interleaving packets would only produce noise. */
+__xip_text
+int xf16cam_talk_acquire(void)
+{
+	int result = -1;
+
+	if (!g_audio_lock_ready || OS_MutexLock(&g_audio_lock, OS_WAIT_FOREVER) != OS_OK)
+		return -1;
+	if (!xf16cam_update_active() && g_talk_info.available && g_talk_users == 0) {
+		g_talk_tail = g_talk_head;
+		g_talk_users = 1;
+		result = 0;
+	}
+	OS_MutexUnlock(&g_audio_lock);
+	return result;
+}
+
+__xip_text
+void xf16cam_talk_release(void)
+{
+	if (!g_audio_lock_ready || OS_MutexLock(&g_audio_lock, OS_WAIT_FOREVER) != OS_OK)
+		return;
+	if (g_talk_users > 0)
+		--g_talk_users;
+	OS_MutexUnlock(&g_audio_lock);
+}
+
+/* Called from the RTSP session thread with one RTP payload of PCMU. A payload
+ * that does not fit is dropped whole rather than split. */
+__xip_text
+int xf16cam_talk_push(const uint8_t *pcmu, uint32_t length)
+{
+	uint32_t head = g_talk_head;
+	uint32_t space = XF16CAM_TALK_RING_BYTES - (head - g_talk_tail);
+	uint32_t i;
+
+	if (g_talk_users == 0 || !g_talk_info.available)
+		return -1;
+	if (length == 0 || length > space) {
+		g_talk_info.dropped++;
+		return -1;
+	}
+	for (i = 0; i < length; ++i)
+		g_talk_ring[(head + i) & (XF16CAM_TALK_RING_BYTES - 1U)] = pcmu[i];
+	__sync_synchronize();
+	g_talk_head = head + length;
+	g_talk_last_ms = OS_TicksToMSecs(OS_GetTicks());
+	g_talk_info.packets++;
+	return 0;
+}
+
+__xip_text
+const XF16CamTalkInfo *xf16cam_talk_info(void)
+{
+	return &g_talk_info;
+}
+
+__xip_text
+uint32_t xf16cam_talk_stack_min_free(void)
+{
+	return OS_ThreadGetStackMinFreeSize(&g_talk_thread);
+}
+#endif

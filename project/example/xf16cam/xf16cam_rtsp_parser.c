@@ -174,6 +174,9 @@ int xf16cam_rtsp_parser_next(XF16CamRtspParser *parser, const char **request)
 				return -1;
 			if (parser->length < total)
 				return 0;
+			if (parser->sink != NULL)
+				parser->sink(parser->sink_context, (uint8_t)parser->data[1],
+				             (const uint8_t *)parser->data + 4, total - 4U);
 			memmove(parser->data, parser->data + total, parser->length - total);
 			parser->length -= total;
 			continue;
@@ -199,6 +202,46 @@ int xf16cam_rtsp_parser_next(XF16CamRtspParser *parser, const char **request)
 		*request = parser->data;
 		return 1;
 	}
+}
+
+__xip_text
+void xf16cam_rtsp_parser_set_sink(XF16CamRtspParser *parser,
+				  XF16CamRtspBinarySink sink, void *context)
+{
+	parser->sink = sink;
+	parser->sink_context = context;
+}
+
+__xip_text
+int xf16cam_rtp_payload(const uint8_t *packet, size_t length,
+			size_t *offset, size_t *payload_length)
+{
+	size_t header = 12U;
+	size_t end = length;
+
+	*offset = 0;
+	*payload_length = 0;
+	if (length < 12U || (packet[0] >> 6) != 2U)
+		return -1;
+	header += 4U * (size_t)(packet[0] & 0x0f);
+	if (packet[0] & 0x10) {
+		if (length < header + 4U)
+			return -1;
+		header += 4U + 4U * (((size_t)packet[header + 2U] << 8) |
+		                     packet[header + 3U]);
+	}
+	if (packet[0] & 0x20) {
+		size_t padding = packet[length - 1U];
+
+		if (padding == 0 || padding > length)
+			return -1;
+		end = length - padding;
+	}
+	if (end < header)
+		return -1;
+	*offset = header;
+	*payload_length = end - header;
+	return 0;
 }
 
 __xip_text

@@ -30,8 +30,17 @@ PRJ_ROOT_PATH := $(ROOT_PATH)/project/example/$(PROJECT)
 # ----------------------------------------------------------------------------
 # board path, including board_config.c and board_config.h
 # ----------------------------------------------------------------------------
+# XF16CAM_TALK builds (RTSP audio backchannel to the speaker) use the
+# project's copy of the board config, whose only change is that the internal
+# codec has no speaker-amplifier pin: the SDK board drives PA23 for that, and
+# on the XF16 PA23 is the camera/SD power rail. Every other build keeps the
+# SDK board file untouched.
 ifeq ($(__CONFIG_CHIP_TYPE), xr872)
+ifneq (,$(findstring XF16CAM_TALK,$(PRJ_EXTRA_SYMBOLS)))
+PRJ_BOARD := $(PRJ_ROOT_PATH)/board
+else
 PRJ_BOARD := $(ROOT_PATH)/project/common/board/xr872_evb_ai
+endif
 else
 PRJ_BOARD := null
 endif
@@ -43,6 +52,7 @@ INCLUDE_PATHS += -I$(PRJ_ROOT_PATH)
 
 DIRS_IGNORE := $(PRJ_ROOT_PATH)/gcc%
 DIRS_IGNORE += $(PRJ_ROOT_PATH)/image%
+DIRS_IGNORE += $(PRJ_ROOT_PATH)/board%
 DIRS_IGNORE += $(ROOT_PATH)/project/common/board/%
 DIRS_IGNORE += $(PRJ_BOARD)
 

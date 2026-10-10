@@ -46,6 +46,15 @@ single-client RTSP stream without PSRAM or an SD card.
   the web page. Camera and storage share the PA23 rail through reference-counted
   ownership; the page reports total/free space and can explicitly format FAT32.
 - Transport: RTP/JPEG (RFC 2435) interleaved over RTSP/TCP
+- Optional two-way audio (`ptz_talk` / `no_ptz_talk` builds, `XF16CAM_TALK`):
+  an RTSP client that sends `Require: www.onvif.org/ver20/backchannel` in
+  DESCRIBE is offered an extra `a=sendonly` PCMU/8000 track (`track3`) and can
+  push audio into it over the same TCP connection; the camera plays it on the
+  speaker through the XR872 codec line-out. One talker at a time; the
+  microphone is silenced while the speaker plays because there is no echo
+  canceller. go2rtc, Home Assistant and Frigate use this; VLC and ffplay only
+  receive. See `tests/xf16cam/talk-go2rtc-test-plan.md` and
+  `tools/xf16cam/rtsp_talk.py`.
 - RTSP input is framed across fragmented/coalesced TCP reads, rejects unsupported
   transports, accepts case-insensitive RTSP header/transport tokens, and applies
   bounded connection and send waits.
@@ -129,8 +138,14 @@ for serial recovery and reflashing.
 - White/fill/"luming" LED in case of PTZ version: PB20; no mode button; setup/reset button: PB19
 - IR illumination LED in case of PTZ version: PA22
 - Microphone: XR872 internal codec analog microphone (AMIC) input, not a GPIO
+- Speaker: XR872 internal codec line-out into an on-board amplifier whose
+  enable is PB21, active low (talk builds only). The pin was recovered from
+  the factory firmware; the SDK evaluation-board config would drive PA23
+  instead, which is the camera/SD rail here, so talk builds use the project's
+  copy of the board config with the switch moved to PB21.
 - SD card: PB16 CMD, PB17 D0, PB18 CLK
-- Console: PB0 TX, PB1 RX; SPI flash: PB2-PB7
+- Console: PB0 TX, PB1 RX; SIP flash: PB8-PB13 (never drive them; PTZ motors
+  use PB2-PB7 and PB14/PB15)
 
 The button pins and roles were recovered from the factory application's board
 configuration. Both inputs are active-low and use internal pull-ups.

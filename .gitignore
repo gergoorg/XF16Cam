@@ -54,3 +54,5 @@ __pycache__/
 !/lib/libwatchpoint.a
 
 /dist
+# tools/xf16cam/udplog.py writes its capture next to wherever it is started
+xf16cam-*.log

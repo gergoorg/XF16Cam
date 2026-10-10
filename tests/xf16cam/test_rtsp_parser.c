@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -93,12 +94,100 @@ static void test_case_insensitive_headers(void)
 	assert(xf16cam_rtsp_header_value("broken", "CSeq", &value, &length) == -1);
 }
 
+typedef struct {
+	unsigned int calls;
+	uint8_t channel;
+	size_t length;
+	uint8_t frame[16];
+} SinkRecord;
+
+static void record_frame(void *context, uint8_t channel, const uint8_t *frame,
+			 size_t length)
+{
+	SinkRecord *record = context;
+
+	record->calls++;
+	record->channel = channel;
+	record->length = length;
+	if (length <= sizeof(record->frame))
+		memcpy(record->frame, frame, length);
+}
+
+static void test_binary_sink(void)
+{
+	static const unsigned char rtp[] = { '$', 4, 0, 6, 0x80, 0, 0, 1, 0xaa, 0xbb };
+	static const char request[] = "GET_PARAMETER rtsp://cam/stream RTSP/1.0\r\nCSeq: 7\r\n\r\n";
+	XF16CamRtspParser parser;
+	SinkRecord record;
+	const char *parsed;
+
+	memset(&record, 0, sizeof(record));
+	xf16cam_rtsp_parser_init(&parser);
+	xf16cam_rtsp_parser_set_sink(&parser, record_frame, &record);
+	/* A frame split across reads reaches the sink once, when complete. */
+	feed(&parser, rtp, 5);
+	assert(xf16cam_rtsp_parser_next(&parser, &parsed) == 0);
+	assert(record.calls == 0);
+	feed(&parser, rtp + 5, sizeof(rtp) - 5U);
+	feed(&parser, request, sizeof(request) - 1U);
+	expect_request(&parser, request);
+	assert(record.calls == 1);
+	assert(record.channel == 4);
+	assert(record.length == 6);
+	assert(memcmp(record.frame, rtp + 4, 6) == 0);
+	/* Without a sink the frame is dropped as before. */
+	xf16cam_rtsp_parser_init(&parser);
+	feed(&parser, rtp, sizeof(rtp));
+	assert(xf16cam_rtsp_parser_next(&parser, &parsed) == 0);
+	assert(record.calls == 1);
+}
+
+static void test_rtp_payload(void)
+{
+	unsigned char packet[40];
+	size_t offset;
+	size_t length;
+
+	memset(packet, 0, sizeof(packet));
+	packet[0] = 0x80;
+	assert(xf16cam_rtp_payload(packet, 15, &offset, &length) == 0);
+	assert(offset == 12 && length == 3);
+	assert(xf16cam_rtp_payload(packet, 12, &offset, &length) == 0);
+	assert(offset == 12 && length == 0);
+	assert(xf16cam_rtp_payload(packet, 11, &offset, &length) == -1);
+	/* Two CSRC entries. */
+	packet[0] = 0x82;
+	assert(xf16cam_rtp_payload(packet, 22, &offset, &length) == 0);
+	assert(offset == 20 && length == 2);
+	/* Header extension of one 32-bit word. */
+	packet[0] = 0x90;
+	packet[15] = 1;
+	assert(xf16cam_rtp_payload(packet, 24, &offset, &length) == 0);
+	assert(offset == 20 && length == 4);
+	assert(xf16cam_rtp_payload(packet, 14, &offset, &length) == -1);
+	/* Padding: last byte counts the padding bytes. */
+	packet[0] = 0xa0;
+	packet[15] = 0;
+	packet[19] = 2;
+	assert(xf16cam_rtp_payload(packet, 20, &offset, &length) == 0);
+	assert(offset == 12 && length == 6);
+	packet[19] = 0;
+	assert(xf16cam_rtp_payload(packet, 20, &offset, &length) == -1);
+	packet[19] = 9;
+	assert(xf16cam_rtp_payload(packet, 20, &offset, &length) == -1);
+	/* Wrong RTP version. */
+	packet[0] = 0x40;
+	assert(xf16cam_rtp_payload(packet, 20, &offset, &length) == -1);
+}
+
 int main(void)
 {
 	test_split_and_coalesced();
 	test_body_and_interleaved_rtcp();
 	test_rejects_malformed_lengths();
 	test_case_insensitive_headers();
+	test_binary_sink();
+	test_rtp_payload();
 	puts("xf16cam RTSP parser tests passed");
 	return 0;
 }

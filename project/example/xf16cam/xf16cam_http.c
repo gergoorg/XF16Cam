@@ -446,10 +446,27 @@ static void xf16cam_http_page(int fd)
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "</section><section class=card><h2>Audio</h2><div class=grid><b>Microphone</b><span>");
 	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
-	                  "%s</span><b>Peak level</b><span><span id=mic>%u</span>/32768</span></div></section></div>",
+	                  "%s</span><b>Peak level</b><span><span id=mic>%u</span>/32768</span>",
 	                  !audio->available ? "AMIC unavailable" :
 	                  audio->active ? "AMIC active, PCMU/8000" : "AMIC ready (on demand)", audio->peak);
 	xf16cam_http_send_all(fd, dynamic, length);
+#ifdef XF16CAM_TALK
+	{
+		const XF16CamTalkInfo *talk = xf16cam_talk_info();
+
+		length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
+		                  "<b>Speaker</b><span>%s</span>"
+		                  "<b>Backchannel</b><span>%lu packets, %lu dropped, %lu underruns, %lu errors</span>"
+		                  "<b>Talk stack spare</b><span>%lu bytes</span>",
+		                  !talk->available ? "unavailable" :
+		                  talk->active ? "playing RTSP backchannel" : "ready (RTSP backchannel, on demand)",
+		                  (unsigned long)talk->packets, (unsigned long)talk->dropped,
+		                  (unsigned long)talk->underruns, (unsigned long)talk->errors,
+		                  (unsigned long)xf16cam_talk_stack_min_free());
+		xf16cam_http_send_all(fd, dynamic, length);
+	}
+#endif
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</div></section></div>");
 
 	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "<div id=network class=panel><section class='card wide'><h2>Wi-Fi setup</h2>"
@@ -742,6 +759,21 @@ static void xf16cam_http_system_json(int fd)
 	                  (unsigned long)media->last_frame_ms,
 	                  (unsigned long)xf16cam_media_active_clients()));
 
+#ifdef XF16CAM_TALK
+	{
+		const XF16CamTalkInfo *talk = xf16cam_talk_info();
+
+		xf16cam_http_system_chunk(fd, body, sizeof(body),
+		                  XF16CAM_XIP_FORMAT(body, sizeof(body),
+		                  "\"talk\":{\"ok\":%s,\"active\":%s,\"packets\":%lu,\"dropped\":%lu,"
+		                  "\"underruns\":%lu,\"errors\":%lu,\"stack\":%lu},",
+		                  talk->available ? "true" : "false",
+		                  talk->active ? "true" : "false",
+		                  (unsigned long)talk->packets, (unsigned long)talk->dropped,
+		                  (unsigned long)talk->underruns, (unsigned long)talk->errors,
+		                  (unsigned long)xf16cam_talk_stack_min_free()));
+	}
+#endif
 	xf16cam_http_system_chunk(fd, body, sizeof(body),
 	                  XF16CAM_XIP_FORMAT(body, sizeof(body),
 	                  "\"audio\":{\"ok\":%s,\"active\":%s,\"peak\":%u,\"mean\":%u,"

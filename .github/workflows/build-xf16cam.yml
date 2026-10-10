@@ -18,11 +18,12 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        build_variant: [ptz, no_ptz, ptz_netlog]
+        build_variant: [ptz, no_ptz, ptz_talk, no_ptz_talk, ptz_talk_netlog]
     env:
       BUILD_VARIANT: ${{ matrix.build_variant }}
+      # _talk adds XF16CAM_TALK, the RTSP audio backchannel to the speaker;
       # _netlog adds XF16CAM_NETLOG, the UDP console mirror.
-      PRJ_EXTRA_SYMBOLS: ${{ startsWith(matrix.build_variant, 'no_ptz') && '-DNO_PTZ ' || '' }}${{ endsWith(matrix.build_variant, '_netlog') && '-DXF16CAM_NETLOG' || '' }}
+      PRJ_EXTRA_SYMBOLS: ${{ startsWith(matrix.build_variant, 'no_ptz') && '-DNO_PTZ ' || '' }}${{ contains(matrix.build_variant, '_talk') && '-DXF16CAM_TALK ' || '' }}${{ endsWith(matrix.build_variant, '_netlog') && '-DXF16CAM_NETLOG' || '' }}
 
     steps:
       - name: Check out source
