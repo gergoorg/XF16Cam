@@ -25,6 +25,7 @@
 #include "xf16cam_http.h"
 #include "xf16cam_log.h"
 #include "xf16cam_media.h"
+#include "xf16cam_mqtt.h"
 #include "xf16cam_net.h"
 #include "xf16cam_power.h"
 #include "xf16cam_sensor.h"
@@ -70,7 +71,7 @@ static void xf16cam_http_message(int fd, const char *status, const char *message
 
 __xip_text
 __attribute__((noinline))
-static const char *xf16cam_http_boot_reason(void)
+const char *xf16cam_http_boot_reason(void)
 {
 	switch (SysGetStartupState()) {
 	case SYS_POWERON:            return "Power-on";
@@ -88,7 +89,7 @@ static const char *xf16cam_http_boot_reason(void)
 
 __xip_text
 __attribute__((noinline))
-static int xf16cam_http_chip_temperature(void)
+int xf16cam_http_chip_temperature(void)
 {
 	wlan_ext_temp_volt_get_t temperature;
 	int32_t value;
@@ -272,6 +273,75 @@ static void xf16cam_http_send_escaped(int fd, const uint8_t *text, size_t length
 	}
 }
 
+#ifdef XF16CAM_MQTT
+__xip_rodata static const char g_mqtt_status_off[] = "disabled";
+__xip_rodata static const char g_mqtt_status_connecting[] = "connecting";
+__xip_rodata static const char g_mqtt_status_connected[] = "connected";
+
+/* IP literal today; the character set also admits a hostname for the day
+ * DNS is linked back in. Keeps the value safe to embed in JSON unescaped. */
+__xip_text
+static int xf16cam_http_mqtt_host_valid(const char *host)
+{
+	for (; *host != '\0'; ++host) {
+		if (!isalnum((unsigned char)*host) && *host != '.' && *host != '-' &&
+		    *host != ':')
+			return 0;
+	}
+	return 1;
+}
+
+/* Second column of the Network tab. Static markup goes out as literals and
+ * only the numbers are formatted, to keep this frame off the HTTP stack. */
+__xip_text
+static void xf16cam_http_mqtt_card(int fd, const XF16CamConfig *config)
+{
+	const XF16CamMqttInfo *mqtt = xf16cam_mqtt_info();
+	const char *status = !mqtt->enabled ? g_mqtt_status_off :
+	                     mqtt->connected ? g_mqtt_status_connected :
+	                                       g_mqtt_status_connecting;
+	char dynamic[64];
+	int length;
+
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<section class=card><h2>MQTT (Home Assistant)</h2>"
+	                  "<p>Publishes the camera state, a JPEG every few seconds in browser-video mode, "
+	                  "and Home Assistant device discovery. The broker is an IP address; blank turns MQTT off.</p>"
+	                  "<form method=post action=/api/mqtt><label>Broker IP"
+	                  "<input name=host maxlength=31 autocapitalize=none spellcheck=false placeholder=192.168.0.2 value=\"");
+	xf16cam_http_send_escaped(fd, (const uint8_t *)config->u.mqtt.host,
+	                          strlen(config->u.mqtt.host), 0);
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "\"></label><label>Port<input type=number name=port min=1 max=65535 value=");
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic), "%u",
+	                            (unsigned int)xf16cam_config_mqtt_port(config));
+	xf16cam_http_send_all(fd, dynamic, (size_t)length);
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "></label><label>Username"
+	                  "<input name=user maxlength=31 autocapitalize=none spellcheck=false value=\"");
+	xf16cam_http_send_escaped(fd, (const uint8_t *)config->u.mqtt.user,
+	                          strlen(config->u.mqtt.user), 0);
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "\"></label><label>Password"
+	                  "<input type=password name=pass maxlength=31 autocomplete=new-password>"
+	                  "<small>Blank keeps the saved password for the same broker.</small></label>"
+	                  "<label>Image interval (seconds)"
+	                  "<input type=number name=interval min=1 max=255 value=");
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic), "%u",
+	                            (unsigned int)xf16cam_config_mqtt_interval(config));
+	xf16cam_http_send_all(fd, dynamic, (size_t)length);
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "></label><button class=primary type=submit>Save and reboot</button></form>"
+	                  "<p>Status: ");
+	xf16cam_http_send_text(fd, status);
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
+	                            ", %lu images sent, %lu reconnects</p></section>",
+	                            (unsigned long)mqtt->images,
+	                            (unsigned long)mqtt->disconnects);
+	xf16cam_http_send_all(fd, dynamic, (size_t)length);
+}
+#endif
+
 __xip_text
 __attribute__((noinline))
 static void xf16cam_http_page(int fd)
@@ -451,8 +521,16 @@ static void xf16cam_http_page(int fd)
 	                  audio->active ? "AMIC active, PCMU/8000" : "AMIC ready (on demand)", audio->peak);
 	xf16cam_http_send_all(fd, dynamic, length);
 
+#ifdef XF16CAM_MQTT
+	/* The MQTT card takes the second grid column, so the Wi-Fi card is half
+	 * width here and keeps the full row on builds without MQTT. */
 	XF16CAM_HTTP_SEND_LITERAL(fd,
-	                  "<div id=network class=panel><section class='card wide'><h2>Wi-Fi setup</h2>"
+	                  "<div id=network class=panel><section class=card><h2>Wi-Fi setup</h2>");
+#else
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "<div id=network class=panel><section class='card wide'><h2>Wi-Fi setup</h2>");
+#endif
+	XF16CAM_HTTP_SEND_LITERAL(fd,
 	                  "<p>Tap a scan result, or enter a hidden SSID.</p>"
 	                  "<button type=button id=scanButton onclick=scan()>Scan networks</button> <span id=scan aria-live=polite></span>"
 	                  "<div id=networks class=nets aria-live=polite></div>"
@@ -464,8 +542,12 @@ static void xf16cam_http_page(int fd)
 	                  "<label>Password<input type=password name=password maxlength=63 autocomplete=new-password>"
 	                  "<small>Blank keeps the saved password for the current SSID, or joins a new open network.</small></label>"
 	                  "<button class=primary type=submit>Save and reboot</button></form>"
-	                  "<form method=post action=/api/ap><button type=submit>Return to open AP</button></form></section></div>"
-	                  "<div id=storage class=panel><section class='card wide'><h2>SD card</h2><div class=grid>"
+	                  "<form method=post action=/api/ap><button type=submit>Return to open AP</button></form></section>");
+#ifdef XF16CAM_MQTT
+	xf16cam_http_mqtt_card(fd, config);
+#endif
+	XF16CAM_HTTP_SEND_LITERAL(fd,
+	                  "</div><div id=storage class=panel><section class='card wide'><h2>SD card</h2><div class=grid>"
 	                  "<b>Status</b><span>");
 	if (storage->mounted) {
 		length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
@@ -507,12 +589,19 @@ static void xf16cam_http_page(int fd)
 	                  "<b>HTTP stack spare</b><span>%lu bytes</span>"
 	                  "<b>Audio stack spare</b><span>%lu bytes</span>"
 	                  "<b>Board stack spare</b><span>%lu bytes</span>"
-					  "<b>Crash task name</b><span>%s</span></div></section>",
+	                  "<b>Crash task name</b><span>%s</span>",
 	                  (unsigned long)OS_ThreadGetStackMinFreeSize(&g_http_thread),
 	                  (unsigned long)xf16cam_audio_stack_min_free(),
 	                  (unsigned long)xf16cam_board_stack_min_free(),
 					  xf16cam_board_get_crash_task_name());
 	xf16cam_http_send_all(fd, dynamic, length);
+#ifdef XF16CAM_MQTT
+	length = XF16CAM_XIP_FORMAT(dynamic, sizeof(dynamic),
+	                  "<b>MQTT stack spare</b><span>%lu bytes</span>",
+	                  (unsigned long)xf16cam_mqtt_stack_min_free());
+	xf16cam_http_send_all(fd, dynamic, length);
+#endif
+	XF16CAM_HTTP_SEND_LITERAL(fd, "</div></section>");
 	xf16cam_http_runtime(fd, dynamic, sizeof(dynamic));
 
 	XF16CAM_HTTP_SEND_LITERAL(fd,
@@ -742,6 +831,32 @@ static void xf16cam_http_system_json(int fd)
 	                  (unsigned long)media->last_frame_ms,
 	                  (unsigned long)xf16cam_media_active_clients()));
 
+#ifdef XF16CAM_MQTT
+	{
+		const XF16CamMqttInfo *mqtt = xf16cam_mqtt_info();
+
+		/* The host is validated to [0-9A-Za-z.:-] on save, so it needs no
+		 * JSON escaping; the password is never reported. */
+		xf16cam_http_system_chunk(fd, body, sizeof(body),
+		                  XF16CAM_XIP_FORMAT(body, sizeof(body),
+		                  "\"mqtt\":{\"on\":%s,\"connected\":%s,\"host\":\"%s\",\"port\":%u,"
+		                  "\"interval\":%u,\"connects\":%lu,\"disconnects\":%lu,"
+		                  "\"images\":%lu,\"states\":%lu,\"commands\":%lu,\"dropped\":%lu,"
+		                  "\"stack\":%lu},",
+		                  mqtt->enabled ? "true" : "false",
+		                  mqtt->connected ? "true" : "false",
+		                  config->u.mqtt.host,
+		                  (unsigned int)xf16cam_config_mqtt_port(config),
+		                  (unsigned int)xf16cam_config_mqtt_interval(config),
+		                  (unsigned long)mqtt->connects,
+		                  (unsigned long)mqtt->disconnects,
+		                  (unsigned long)mqtt->images,
+		                  (unsigned long)mqtt->states,
+		                  (unsigned long)mqtt->commands,
+		                  (unsigned long)mqtt->dropped,
+		                  (unsigned long)xf16cam_mqtt_stack_min_free()));
+	}
+#endif
 	xf16cam_http_system_chunk(fd, body, sizeof(body),
 	                  XF16CAM_XIP_FORMAT(body, sizeof(body),
 	                  "\"audio\":{\"ok\":%s,\"active\":%s,\"peak\":%u,\"mean\":%u,"
@@ -1022,6 +1137,9 @@ static int xf16cam_http_handle(int fd)
 	char ssid[XF16CAM_SSID_MAX_LEN + 1];
 	char psk[XF16CAM_PSK_MAX_LEN + 1];
 	char mode[8];
+#ifdef XF16CAM_MQTT
+	char user[XF16CAM_MQTT_USER_MAX_LEN + 1];
+#endif
 
 	memset(g_request, 0, sizeof(g_request));
 	header_end = NULL;
@@ -1144,6 +1262,50 @@ static int xf16cam_http_handle(int fd)
 		}
 		XF16CAM_HTTP_MESSAGE(fd, "200 OK", "Open AP restored. Rebooting...");
 		return XF16CAM_HTTP_COLD_REBOOT;
+#ifdef XF16CAM_MQTT
+	} else if (strcmp(method, "POST") == 0 && strcmp(path, "/api/mqtt") == 0) {
+		/* host and pass reuse the Wi-Fi buffers: the HTTP stack is small. */
+		unsigned long port = 0;
+		unsigned long interval = 0;
+		int invalid = xf16cam_form_value(body, "host", ssid, sizeof(ssid)) != 0 ||
+		              xf16cam_form_value(body, "user", user, sizeof(user)) != 0 ||
+		              xf16cam_form_value(body, "pass", psk, sizeof(psk)) != 0 ||
+		              !xf16cam_http_mqtt_host_valid(ssid);
+
+		if (!invalid && xf16cam_form_value(body, "port", mode, sizeof(mode)) == 0 &&
+		    mode[0] != '\0') {
+			port = strtoul(mode, NULL, 10);
+			invalid = port == 0 || port > 65535UL;
+		}
+		if (!invalid && xf16cam_form_value(body, "interval", mode, sizeof(mode)) == 0 &&
+		    mode[0] != '\0') {
+			interval = strtoul(mode, NULL, 10);
+			invalid = interval == 0 || interval > 255UL;
+		}
+		if (!invalid) {
+			const XF16CamConfig *current = xf16cam_config_get();
+
+			/* A blank password for the saved broker means "unchanged",
+			 * as with the Wi-Fi form. */
+			if (psk[0] == '\0' && ssid[0] != '\0' &&
+			    strcmp(ssid, current->u.mqtt.host) == 0)
+				memcpy(psk, current->u.mqtt.pass, sizeof(current->u.mqtt.pass));
+			invalid = xf16cam_config_save_mqtt(ssid, (uint16_t)port, user, psk,
+			                                   (uint8_t)interval) != 0;
+		}
+		if (invalid) {
+			XF16CAM_HTTP_MESSAGE(fd, "400 Bad Request",
+			                     "Invalid MQTT settings. The broker is an IP address; name and password hold up to 31 characters.");
+			return 0;
+		}
+		if (xf16cam_update_begin() != 0) {
+			XF16CAM_HTTP_MESSAGE(fd, "409 Conflict",
+			                     "MQTT settings were saved, but reboot was deferred by another update.");
+			return XF16CAM_HTTP_KEEP_RUNNING;
+		}
+		XF16CAM_HTTP_MESSAGE(fd, "200 OK", "MQTT settings saved. Rebooting...");
+		return XF16CAM_HTTP_COLD_REBOOT;
+#endif
 	} else if(strcmp(method, "POST") == 0 && strcmp(path, "/api/led") == 0) {
 		int led_on = xf16cam_form_value(body, "led_on", mode, sizeof(mode)) == 0 &&
 		             strcmp(mode, "true") == 0;

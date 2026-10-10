@@ -18,11 +18,14 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        build_variant: [ptz, no_ptz, ptz_netlog]
+        build_variant: [ptz, no_ptz, ptz_netlog, ptz_mqtt, no_ptz_mqtt]
     env:
       BUILD_VARIANT: ${{ matrix.build_variant }}
-      # _netlog adds XF16CAM_NETLOG, the UDP console mirror.
-      PRJ_EXTRA_SYMBOLS: ${{ startsWith(matrix.build_variant, 'no_ptz') && '-DNO_PTZ ' || '' }}${{ endsWith(matrix.build_variant, '_netlog') && '-DXF16CAM_NETLOG' || '' }}
+      # _netlog adds XF16CAM_NETLOG, the UDP console mirror; _mqtt (last) adds
+      # XF16CAM_MQTT, the Home Assistant MQTT client. Suffixes combine, so
+      # every test uses contains(), not endsWith(). Keep this mapping in step
+      # with the Dockerfile.
+      PRJ_EXTRA_SYMBOLS: ${{ startsWith(matrix.build_variant, 'no_ptz') && '-DNO_PTZ ' || '' }}${{ contains(matrix.build_variant, '_netlog') && '-DXF16CAM_NETLOG ' || '' }}${{ contains(matrix.build_variant, '_mqtt') && '-DXF16CAM_MQTT' || '' }}
 
     steps:
       - name: Check out source
@@ -37,6 +40,16 @@ jobs:
             project/example/xf16cam/xf16cam_rtsp_parser.c \
             -o /tmp/xf16cam-rtsp-parser-test
           /tmp/xf16cam-rtsp-parser-test
+
+      - name: Test MQTT payload generators
+        shell: bash
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror -DXF16CAM_MQTT \
+            -Iinclude -Iproject/example/xf16cam \
+            tests/xf16cam/test_mqtt_payload.c \
+            project/example/xf16cam/xf16cam_mqtt_payload.c \
+            -o /tmp/xf16cam-mqtt-payload-test
+          /tmp/xf16cam-mqtt-payload-test
 
       - name: Install Arm GNU Toolchain
         uses: carlosperate/arm-none-eabi-gcc-action@v1
@@ -71,6 +84,12 @@ jobs:
       - name: Check critical code placement
         shell: bash
         run: |
+          # The MQTT client must be absent from non-mqtt images and in XIP otherwise.
+          if [[ "$BUILD_VARIANT" == *_mqtt* ]]; then
+            mqtt_check="--require-xip xf16cam_mqtt_task"
+          else
+            mqtt_check="--require-absent xf16cam_mqtt_task"
+          fi
           python3 tools/xf16cam/check_symbol_placement.py \
             --elf project/example/xf16cam/gcc/xf16cam.axf \
             --require-sram xf16cam_http_flash_info \
@@ -78,15 +97,18 @@ jobs:
             --require-sram flashc_suspend \
             --require-xip xf16cam_http_start \
             --require-absent dns_table \
-            --require-absent igmp_group_list
+            --require-absent igmp_group_list \
+            $mqtt_check
 
       - name: Check 1 MiB flash budget
         shell: bash
         run: |
+          # _mqtt builds carry ~12 KB more XIP than the 64 KiB floor allows.
           mkdir -p dist
           python3 tools/xf16cam/check_image_budget.py \
             --config project/example/xf16cam/image/xr872/image_auto_cal.cfg \
             --image-dir project/example/xf16cam/image/xr872 \
+            --xip-reserve ${{ contains(matrix.build_variant, '_mqtt') && '56K' || '64K' }} \
             | tee dist/image-budget.txt
           {
             echo '```text'

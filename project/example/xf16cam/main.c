@@ -28,6 +28,7 @@
 #include "xf16cam_http.h"
 #include "xf16cam_log.h"
 #include "xf16cam_media.h"
+#include "xf16cam_mqtt.h"
 #include "xf16cam_net.h"
 #include "xf16cam_rail.h"
 #include "xf16cam_rtsp_parser.h"
@@ -72,7 +73,14 @@ static void xf16_camera_ctrl_prehold_low(void);
 static int xf16_board_camera_power_prepare(void);
 static void xf16_board_camera_power_down(void);
 
-static uint8_t *gmemaddr;
+/* The one capture arena, allocated for the life of the device. Until
+ * v0.17.16 it was malloc'd on every cold camera acquire and freed on
+ * release, and a 104 KB block is the first thing a fragmented heap fails
+ * to serve: once any task stack or socket buffer had landed inside the
+ * hole the released arena left, no client could capture again ("malloc
+ * fail" on every RTSP client). A static array costs the same SRAM as
+ * holding the allocation and cannot fail. */
+static uint8_t g_capture_arena[JPEG_SRAM_SIZE] __attribute__((aligned(4)));
 static CAMERA_Mgmt mem_mgmt;
 static OS_Mutex_t g_camera_lock;
 static int g_camera_lock_ready;
@@ -183,14 +191,9 @@ static int camera_mem_create(CAMERA_JpegCfg *jpeg_cfg, CAMERA_Mgmt *mgmt)
 	uint32_t i;
 	(void)jpeg_cfg;
 
-	addr = (uint8_t *)malloc(JPEG_SRAM_SIZE);
-	if (!addr) {
-		printf("malloc fail\n");
-		return -1;
-	}
-	memset(addr, 0, JPEG_SRAM_SIZE);
+	addr = g_capture_arena;
 	end_addr = addr + JPEG_SRAM_SIZE;
-	printf("malloc addr: %p -> %p\n", addr, end_addr);
+	printf("xf16cam capture arena: %p -> %p\n", addr, end_addr);
 
 	/* Online JPEG mode does not consume a YUV framebuffer. Still capture keeps
 	 * this single buffer immutable until the next capture call; both transports
@@ -205,31 +208,19 @@ static int camera_mem_create(CAMERA_JpegCfg *jpeg_cfg, CAMERA_Mgmt *mgmt)
 		cursor = mgmt->jpeg_buf[i].addr + JPEG_BUFF_SIZE;
 		if (cursor > end_addr) {
 			printf("jpeg buffer %lu exceeds capture arena\n", (unsigned long)i);
-			free(addr);
 			return -1;
 		}
 	}
 	printf("xf16cam buffers: count=%u bytes_each=%u arena=%u\n",
 	       JPEG_BUFFER_COUNT, JPEG_BUFF_SIZE, JPEG_SRAM_SIZE);
 
-	gmemaddr = addr;
 	return 0;
-}
-
-__xip_text
-static void camera_mem_destroy(void)
-{
-	if (gmemaddr) {
-		free(gmemaddr);
-		gmemaddr = NULL;
-	}
 }
 
 __xip_text
 static void camera_deinit(void)
 {
 	HAL_CAMERA_DeInit();
-	camera_mem_destroy();
 	xf16_board_camera_power_down();
 }
 
@@ -272,7 +263,6 @@ static int xf16cam_camera_manager_init(void)
 	if (xf16_board_camera_power_prepare() != 0)
 		return -1;
 	if (camera_init() != 0) {
-		camera_mem_destroy();
 		xf16_board_camera_power_down();
 		return -1;
 	}
@@ -292,7 +282,6 @@ static int xf16cam_camera_acquire(void)
 		if (xf16_board_camera_power_prepare() != 0)
 			goto out;
 		if (camera_init() != 0) {
-			camera_mem_destroy();
 			xf16_board_camera_power_down();
 			goto out;
 		}
@@ -478,6 +467,61 @@ static int xf16cam_capture_jpeg(CAMERA_JpegBuffInfo *info, uint8_t **jpeg,
 	if (info->size > g_media_info.largest_jpeg)
 		g_media_info.largest_jpeg = info->size;
 	return 0;
+}
+
+/* One frame for a non-stream consumer (the MQTT publisher). The capture lock
+ * stays held until xf16cam_media_snapshot_end() so the single arena is
+ * immutable while the caller transmits it; stream clients wait meanwhile, so
+ * keep that window bounded. */
+__xip_text
+int xf16cam_media_snapshot_begin(const uint8_t **jpeg, uint32_t *jpeg_len)
+{
+	CAMERA_JpegBuffInfo info;
+	uint8_t *frame;
+	int attempt;
+
+	if (xf16cam_camera_acquire() != 0)
+		return -1;
+	if (!g_capture_lock_ready ||
+	    OS_MutexLock(&g_capture_lock, OS_WAIT_FOREVER) != OS_OK) {
+		xf16cam_camera_release();
+		return -1;
+	}
+	for (attempt = 0; attempt < 3; ++attempt) {
+		int capture = xf16cam_capture_jpeg(&info, &frame, jpeg_len);
+
+		if (capture == 0) {
+			*jpeg = frame;
+			return 0;
+		}
+		if (capture < 0)
+			break;
+	}
+	OS_MutexUnlock(&g_capture_lock);
+	xf16cam_camera_release();
+	return -1;
+}
+
+__xip_text
+void xf16cam_media_snapshot_end(void)
+{
+	OS_MutexUnlock(&g_capture_lock);
+	xf16cam_camera_release();
+}
+
+/* Keep the camera powered and initialised between snapshots. A 0 -> 1
+ * acquire runs the cold sensor init and toggles the shared PA23 rail, which
+ * is too much to repeat every few seconds. */
+__xip_text
+int xf16cam_media_camera_hold(void)
+{
+	return xf16cam_camera_acquire();
+}
+
+__xip_text
+void xf16cam_media_camera_unhold(void)
+{
+	xf16cam_camera_release();
 }
 
 __xip_text
@@ -1138,9 +1182,14 @@ int main(void)
 		printf("xf16cam media rail: initialization failed\n");
 	if (xf16cam_config_init() != 0)
 		printf("xf16cam config: persistence unavailable\n");
+	/* The MQTT task sleeps until the network is up and retires itself in
+	 * AP mode, so it can be created before the network exists. */
+	if (xf16cam_mqtt_start() != 0)
+		printf("xf16cam mqtt: start failed; management remains available\n");
 
-	/* Probe once so management can report the sensor, then release the rail and
-	 * capture arena after services start. Stream clients reacquire both. */
+	/* Probe once so management can report the sensor, then release the rail
+	 * after services start. Stream clients reacquire it; the capture arena
+	 * is static and stays. */
 	camera_ready = xf16cam_camera_manager_init() == 0;
 	if (!camera_ready) {
 		printf("xf16cam camera unavailable; continuing with management services\n");

@@ -33,7 +33,7 @@ lint step and no test runner beyond one host-compiled unit test.
 Windows (Docker, produces `dist/`):
 
 ```bat
-buildXF16Cam.bat ptz      REM or: no_ptz, ptz_netlog, no_ptz_netlog
+buildXF16Cam.bat ptz      REM or: no_ptz, ptz_netlog, no_ptz_netlog, ptz_mqtt, no_ptz_mqtt
 ```
 
 Linux/CI-equivalent, with `arm-none-eabi-gcc` on `PATH`:
@@ -43,7 +43,8 @@ printf '%s\n' '__CONFIG_CHIP_TYPE ?= xr872' '__CONFIG_HOSC_TYPE ?= 40' > .config
 chmod +x tools/mkimage
 make -C project/example/xf16cam/gcc \
   CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")" \
-  PRJ_EXTRA_SYMBOLS="" image      # add -DNO_PTZ for the fixed-camera board
+  PRJ_EXTRA_SYMBOLS="" image      # add -DNO_PTZ for the fixed-camera board,
+                                  # -DXF16CAM_MQTT for the Home Assistant MQTT client
 make -C project/example/xf16cam/gcc \
   CC_DIR="$(dirname "$(command -v arm-none-eabi-gcc)")" \
   PRJ_EXTRA_SYMBOLS="" image_xz
@@ -84,17 +85,24 @@ tree can be updated without losing anything:
 
 ### Test
 
-One host test, run before the firmware build in both CI and the Dockerfile:
+Two host tests, run before the firmware build in both CI and the Dockerfile:
 
 ```sh
 cc -std=c11 -Wall -Wextra -Werror -Iinclude -Iproject/example/xf16cam \
   tests/xf16cam/test_rtsp_parser.c project/example/xf16cam/xf16cam_rtsp_parser.c \
   -o /tmp/xf16cam-rtsp-parser-test && /tmp/xf16cam-rtsp-parser-test
+cc -std=c11 -Wall -Wextra -Werror -DXF16CAM_MQTT -Iinclude -Iproject/example/xf16cam \
+  tests/xf16cam/test_mqtt_payload.c project/example/xf16cam/xf16cam_mqtt_payload.c \
+  -o /tmp/xf16cam-mqtt-payload-test && /tmp/xf16cam-mqtt-payload-test
 ```
 
 The RTSP request parser is deliberately factored out of `main.c` into
-`xf16cam_rtsp_parser.c` so it can be compiled and tested on the host. Keep new
-pure-logic code testable the same way.
+`xf16cam_rtsp_parser.c` so it can be compiled and tested on the host, and the
+MQTT state/discovery generators and PUBLISH header encoder live in
+`xf16cam_mqtt_payload.c` for the same reason. Keep new pure-logic code
+testable the same way. There is no C compiler on the Windows host; run the
+tests in a container (`docker run --rm -v D:/...:/w -w /w gcc:12 sh -c '...'`,
+with `MSYS_NO_PATHCONV=1` from Git Bash).
 
 ### Gates CI enforces (run these locally before claiming a change fits)
 
@@ -118,20 +126,53 @@ The absent sentinels prove the lwIP link-out still takes effect after an SDK
 update. `flashc_suspend`, the flash controller's PM hook, must be in SRAM on
 both variants: power management cannot be compiled out (see Build).
 
-CI builds `ptz`, `no_ptz` and `ptz_netlog`; a change must compile under all
-of them. `-DXF16CAM_NETLOG` (the `_netlog` suffix) compiles in the console
-mirror: `xf16cam_log.c` installs its own libc stdout writer, so every
-`printf` in the system still reaches the UART and is also kept in a 2 KiB
-RAM ring that the board task broadcasts over UDP port 5514 and `GET /api/log`
-returns as text. It exists because the board has no serial connection
-without disassembly; `tools/xf16cam/udplog.py` is the PC side. The writer
-itself must stay in SRAM (no `__xip_text`), since printf runs while flash is
-disabled during OTA and settings writes. Nothing survives a reset, so every
-deliberate reboot calls `xf16cam_log_flush()` first and the reason it printed
-leaves the board; a hard fault does not reboot at all (the ROM handler halts,
-and the hardware watchdog is not enabled), so a silent hang with no boot
-marker is a crash. Measured cost on `ptz`: 120 bytes of app slot, 376 bytes
-of XIP, plus the 2 KiB ring in `.bss`.
+The variant name is `ptz` or `no_ptz` plus optional suffixes, in this order:
+`_netlog`, then `_mqtt`. CI builds `ptz`, `no_ptz`, `ptz_netlog`, `ptz_mqtt`
+and `no_ptz_mqtt`; a change must compile under all of them. The Dockerfile
+and the workflow each map the suffixes to `-DXF16CAM_NETLOG` and
+`-DXF16CAM_MQTT` on their own; keep the two in step.
+
+`XF16CAM_NETLOG` (the `_netlog` suffix) compiles in the console mirror:
+`xf16cam_log.c` installs its own libc stdout writer, so every `printf` in the
+system still reaches the UART and is also kept in a 2 KiB RAM ring that the
+board task broadcasts over UDP port 5514 and `GET /api/log` returns as text.
+It exists because the board has no serial connection without disassembly;
+`tools/xf16cam/udplog.py` is the PC side. The writer itself must stay in SRAM
+(no `__xip_text`), since printf runs while flash is disabled during OTA and
+settings writes. Nothing survives a reset, so every deliberate reboot calls
+`xf16cam_log_flush()` first and the reason it printed leaves the board; a
+hard fault does not reboot at all (the ROM handler halts, and the hardware
+watchdog is not enabled), so a silent hang with no boot marker is a crash.
+Measured cost on `ptz`: 120 bytes of app slot, 376 bytes of XIP, plus the
+2 KiB ring in `.bss`.
+
+`XF16CAM_MQTT` (the `_mqtt` suffix) compiles in `xf16cam_mqtt.c`, an MQTT
+client for Home Assistant: retained device discovery on
+`homeassistant/device/<host>/config`, a state document on
+`xf16cam/<host>/state`, a JPEG per interval on `xf16cam/<host>/image` in
+browser media mode, `online`/`offline` on `xf16cam/<host>/status` (the LWT),
+and commands on `xf16cam/<host>/cmd/{led,ir,ptz,reboot}`; the state JSON has
+the same keys in both media modes, carrying the RTSP URL when there is no
+image. It is opt-in because the vendored Paho client (`src/net/mqtt`, always
+on the link line, placed in XIP by `appos.ld`, garbage-collected until
+referenced) plus the discovery text costs 13.5 KB of XIP and 672 bytes of app
+slot (`ptz_mqtt` 0.17.16: 19,720 / 62,600 / 69,332 free against 20,408 /
+77,092 / 77,604 for plain `ptz`), more than the headroom above the 64 KiB
+floor, so `_mqtt` builds are checked with `--xip-reserve 56K`. The client uses the library only for CONNECT, SUBSCRIBE,
+PING and DISCONNECT: `MQTTPublish` needs the whole packet in its buffer, so
+every publish here streams its payload behind a header from
+`xf16cam_mqtt_publish_header()`, and `MQTTYield` overflows the read buffer on
+an oversize inbound packet (its assert only prints), so `xf16cam_mqtt_poll()`
+reads the fixed header itself and drains what does not fit. Do not call
+`MQTTYield` or `MQTTPublish` on that client. The publisher holds the camera
+between shots for intervals up to 20 s (a cold acquire re-inits the sensor);
+longer intervals acquire per shot because a held camera counts for the board
+task's 30 s stall watchdog. It releases the camera whenever an update holds
+the lock. The broker must be an IP literal: lwIP DNS stays linked out, and
+`xf16cam_lwip_stubs.c` resolves literals through `getaddrinfo`. The task is
+created in `main()` before the network exists; it sleeps until the link is
+up and retires itself in AP mode. Its 3 KiB stack is what exposed the heap
+fragmentation that made the capture arena static (see Memory discipline).
 
 ## Memory discipline
 
@@ -176,6 +217,15 @@ habits are load-bearing:
   ~100 KiB JPEG buffer, and no YUV framebuffer. Frames are captured one at a
   time and each buffer stays immutable until fully transmitted, so a slow client
   can never observe a buffer mid-overwrite. Do not add a second frame buffer.
+  The arena is a **static array** (`g_capture_arena` in `main.c`), not a heap
+  allocation. Until v0.17.16 it was malloc'd on every cold camera acquire and
+  freed on release, and the SDK heap is first-fit over about 270 KB: once any
+  long-lived allocation (a client task stack, the MQTT task stack) landed in
+  the hole the freed arena left, the 104 KB block could never be served again
+  and every stream client failed with `malloc fail`. The static array costs
+  the same SRAM as holding the allocation, so the free-heap figure on the
+  System tab is about 104 KB lower than on older images, and it cannot fail.
+  Do not turn it back into a malloc.
 
 Sensor register tables live in XIP flash (`xf16cam_sensor_tables.c`, ~40 KB) and
 share one retrying SCCB writer. Adding a sensor means adding a descriptor plus a
@@ -220,7 +270,12 @@ probes the sensor, then **releases** camera power. Resources are demand-driven.
   to keep the previous session's last frame and any client arriving 30 s
   later was rebooted during the cold sensor re-init — the older unconditional
   2-hour reboot is commented out, leave it that way) and, on PTZ builds,
-  **day/night switching** from a CDS sensor on ADC5 every 5 s.
+  **day/night switching** from a CDS sensor on ADC5 every 5 s. The ADC is
+  shared with the battery measurement through
+  `xf16cam_board_adc_acquire/release()`: a second `HAL_ADC_Init` while the
+  first is live fails (`ADC state: 3`), which broke the Measure button once
+  the CDS check stopped re-initialising per cycle, and a `HAL_ADC_DeInit`
+  from the battery path would have taken the converter from under it.
 - **`xf16cam_audio.c`** — on-demand AMIC capture; publishes PCMU silence during
   the 2.1 s analogue settling window so the media clock stays intact.
 - **`xf16cam_storage.c`**, **`xf16cam_power.c`**, **`xf16cam_ptz.c`**,
@@ -230,17 +285,38 @@ probes the sensor, then **releases** camera power. Resources are demand-driven.
   IGMP out of the image without touching the SDK (see Build).
 - **`xf16cam_log.c`** — `XF16CAM_NETLOG` only: console mirror to a RAM ring,
   UDP broadcast and `/api/log` (see Build).
+- **`xf16cam_mqtt.c` + `xf16cam_mqtt_payload.c`** — `XF16CAM_MQTT` only: the
+  Home Assistant MQTT client (see Build) and its host-tested payload
+  generators. It takes frames through `xf16cam_media_snapshot_begin/end()`
+  in `main.c`, which acquire the camera and the capture lock around one
+  `xf16cam_capture_jpeg()` exactly as an MJPEG client does.
 
 The DHCP hostname is `XF16CAM-<last three eFuse MAC bytes>`, built once in
 `xf16cam_net_start()` before `net_switch_mode()` and handed to the SDK's
 `ethernetif_set_hostname()`. It is deliberately not configurable: the eFuse MAC
 makes it unique per board from a single firmware image, with no provisioning
-step and nothing an OTA or a reflash can overwrite. Adding an editable name
-would mean growing `XF16CamConfig`, and `xf16cam_config_storage_valid()` rejects
-any record whose `length` differs from `sizeof(XF16CamConfig)` — so that change
-needs a real schema-3 migration or it silently resets every device to AP mode.
-Flash is fully allocated (settings at 1016 KiB, SDK sysinfo at 1020 KiB), so
-there is no spare sector to store it in separately.
+step and nothing an OTA or a reflash can overwrite. It doubles as the MQTT
+client id and topic id.
+
+`XF16CamConfig` is at schema 3 (220 bytes): the 116-byte schema 1/2 record,
+then at offset 109 a `feature` tag naming the integration variant that wrote
+the record (`XF16CAM_FEATURE_NONE`, `_MQTT` = 'M', `_ESPHOME` = 'E') and at
+112 a 104-byte union holding that variant's block (`u.mqtt` on `_mqtt`
+builds). Every variant shares the one layout, but a record never holds more
+than one integration's fields: `xf16cam_config_adopt_block()` clears the
+block and rewrites the tag when it was written by a different variant or is
+corrupt, so an OTA between `_mqtt`, `_esphome` and plain images keeps Wi-Fi,
+media mode and resolution and only the integration has to be set up again.
+`xf16cam_config_storage_valid()` checks the shared prefix and still rejects
+any record whose `length` differs from `sizeof(XF16CamConfig)`;
+`xf16cam_config_load_legacy()` is what keeps that from resetting devices to
+AP mode: it reads a 116-byte record, checks it with its own checksum span,
+copies the byte-identical prefix and rewrites it as schema 3. A block that
+outgrows 104 bytes cannot just grow the union: the FDCM reader refuses a read
+whose size differs from the stored record, so that needs a fixed-size
+envelope or a raw header read, plus the legacy dance (a new legacy length and
+checksum offset). Flash is fully allocated (settings at 1016 KiB, SDK sysinfo
+at 1020 KiB), so there is no spare sector for anything else.
 
 A missing or unsupported sensor is non-fatal by design: Wi-Fi, HTTP, OTA, audio,
 SD, and diagnostics all stay up while video reports the camera offline. Preserve
@@ -284,11 +360,14 @@ full). RTSP: `rtsp://<device-ip>:8554/stream` — force TCP transport in VLC, or
 `-rtsp_transport tcp` with ffplay.
 
 JSON reads: `GET /api/scan`, `/api/audio`, `/api/led`, `/api/ir_led`, and
-`/api/system` (every System/Live/Storage diagnostic in one streamed response).
-`GET /api/log` (`XF16CAM_NETLOG` builds only) returns the last 2 KiB of
-console output as text.
+`/api/system` (every System/Live/Storage diagnostic in one streamed response;
+`XF16CAM_MQTT` builds add an `mqtt` object with the broker, counters and the
+task's spare stack, never the password). `GET /api/log` (`XF16CAM_NETLOG`
+builds only) returns the last 2 KiB of console output as text.
 
-Form-encoded writes: `POST /api/wifi`, `/api/ap`, `/api/media`, `/api/resolution`
+Form-encoded writes: `POST /api/wifi`, `/api/ap`, `/api/media`, `/api/resolution`,
+`/api/mqtt` (`XF16CAM_MQTT` only: `host`, `port`, `user`, `pass`, `interval`;
+blank `host` disables, blank `pass` keeps the saved one for the same host)
 (these reboot), `/api/led`, `/api/ir_led`, `/api/ptz` (`mode=up|down|left|right|home`,
 501 under `NO_PTZ`), `/api/power` (measure battery), `/api/hibernate` (`NO_PTZ`
 only; PTZ builds have neither the route nor the button, so it is a 404 there),
